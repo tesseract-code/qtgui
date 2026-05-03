@@ -249,6 +249,7 @@ class ToolBarStyle:
             QToolBar {{
                 background-color: {toolbar_bg};
                 border: none;
+                border-radius: {self.border_radius}px;
                 spacing: {self.toolbar_spacing}px;
                 padding: {self.toolbar_padding}px;
             }}

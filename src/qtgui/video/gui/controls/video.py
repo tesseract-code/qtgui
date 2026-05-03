@@ -33,7 +33,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from cross_platform.dev.icons_legacy.svg_path import get_icon, IconType
 from qtgui.video.gui.controls.volume import VolumeWidget
 from qtgui.pixmap import colorize_pixmap
 
@@ -97,13 +96,13 @@ QLabel#totalTimeLabel {{
 """
 
 
-def _icon(icon_type: IconType) -> QIcon:
+def _icon(icon_path: str) -> QIcon:
     """Return a white icon of the standard transport size."""
-    return get_icon(icon_type, size=_ICON_SIZE, color=_ICON_COLOR)
+    return QIcon(colorize_pixmap(QPixmap(icon_path), QColor("white")))
 
 
 def _tool_button(
-    icon_type: IconType,
+    icon_path: str,
     size: int,
     *,
     checkable: bool = False,
@@ -113,13 +112,13 @@ def _tool_button(
     Construct a styled QToolButton with a vector icon.
 
     Args:
-        icon_type:  Icon to display.
+        icon_path:  Icon to display.
         size:       Width and height in pixels (square).
         checkable:  Whether the button is a toggle.
         tooltip:    Optional tooltip string.
     """
     btn = QToolButton()
-    btn.setIcon(_icon(icon_type))
+    btn.setIcon(_icon(icon_path))
     btn.setFixedSize(size, size)
     btn.setCheckable(checkable)
     btn.setIconSize(QSize(size - 10, size - 10))
@@ -243,16 +242,16 @@ class VideoControlsWidget(QWidget):
 
         # ── Transport buttons (centre) ─────────────────────────────────────
         self.backward_btn = _tool_button(
-            IconType.REWIND, 36, tooltip="Step backward"
+            "line-icons:rewind-line.svg", 36, tooltip="Step backward"
         )
         self.backward_btn.clicked.connect(self.backward_clicked)
 
         self.play_pause_btn = _tool_button(
-            IconType.PLAY, 46, tooltip="Play / Pause  [Space]"
+            "line-icons:play-line.svg", 46, tooltip="Play / Pause  [Space]"
         )
 
         self.forward_btn = _tool_button(
-            IconType.FORWARD, 36, tooltip="Step forward"
+            "line-icons:speed-line.svg", 36, tooltip="Step forward"
         )
         self.forward_btn.clicked.connect(self.forward_clicked)
 
@@ -342,8 +341,9 @@ class VideoControlsWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _refresh_play_icon(self) -> None:
-        icon_type = IconType.PAUSE if self._is_playing else IconType.PLAY
-        self.play_pause_btn.setIcon(_icon(icon_type))
+        icon_path = "line-icons:pause-line.svg" if self._is_playing else (
+            "line-icons:play-line.svg")
+        self.play_pause_btn.setIcon(_icon(icon_path))
 
     # ------------------------------------------------------------------
     # Public API

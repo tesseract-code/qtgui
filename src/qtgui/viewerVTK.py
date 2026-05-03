@@ -58,10 +58,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import vtkmodules.all as vtk
-import vtkmodules.vtkInteractionStyle
-import vtkmodules.vtkRenderingOpenGL2
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QSurfaceFormat, QIcon
+from PyQt6.QtGui import QSurfaceFormat, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
@@ -80,9 +78,8 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QToolButton,
+    QToolButton, QToolBar,
 )
-from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.vtkCommonColor import vtkNamedColors
 from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints, vtkLookupTable
@@ -115,8 +112,8 @@ from vtkmodules.vtkRenderingCore import (
     vtkWindowToImageFilter,
 )
 
-from pycore.platform import IS_MACOS
 from qtcore.vtk_utils import SafeVTKWidget
+from qtgui.pixmap import colorize_pixmap
 from qtgui.style.toolbar import StyledToolBar
 
 logger = logging.getLogger(__name__)
@@ -149,7 +146,6 @@ def configure_surface_format():
     fmt.setVersion(4, 1)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     QSurfaceFormat.setDefaultFormat(fmt)
-
 
 
 def _capture_actor_props(actor: vtkActor) -> dict:
@@ -652,14 +648,21 @@ class ModelViewerWidget(QWidget):
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(2)
 
-        toolbar = StyledToolBar("Main Toolbar")
+        toolbar = QToolBar("Main Toolbar")
         root.addWidget(toolbar)
 
         def _btn(label: str, slot, icon: Optional[str] = None) -> QToolButton:
             b = QToolButton()
             b.setToolTip(label)
             if icon:
-                b.setIcon(QIcon(icon))
+                b.setIcon(
+                    QIcon(
+                        colorize_pixmap(
+                            QPixmap(icon),
+                            self.palette().highlightedText().color()
+                        )
+                    )
+                )
             b.clicked.connect(slot)
             toolbar.addWidget(b)
             return b
@@ -673,14 +676,20 @@ class ModelViewerWidget(QWidget):
 
         self._wire_btn = QToolButton()
         self._wire_btn.setCheckable(True)
-        self._wire_btn.setIcon(QIcon("line-icons:global-line.svg"))
+        self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
+            "line-icons:global-line.svg"), self.palette().highlightedText(
+
+        ).color())))
         self._wire_btn.setToolTip("Toggle wireframe/solid")
         self._wire_btn.toggled.connect(self._toggle_wireframe)
         toolbar.addWidget(self._wire_btn)
 
         self._grid_btn = QToolButton()
         self._grid_btn.setCheckable(True)
-        self._grid_btn.setIcon(QIcon("line-icons:grid-line.svg"))
+        self._grid_btn.setIcon(QIcon(QIcon(colorize_pixmap(QPixmap(
+            "line-icons:grid-line.svg"), self.palette().highlightedText(
+
+        ).color()))))
         self._grid_btn.setToolTip("Toggle bounding-box grid")
         self._grid_btn.toggled.connect(self.toggle_grid)
         toolbar.addWidget(self._grid_btn)
@@ -750,6 +759,7 @@ class ModelViewerWidget(QWidget):
 
         mode_group = QGroupBox("Analysis Mode")
         mode_layout = QVBoxLayout(mode_group)
+        mode_layout.setSpacing(10)
         self._mode_btn_group = QButtonGroup(self)
         self._mode_radio: Dict[AnalysisMode, QRadioButton] = {}
         for label, mode in [
@@ -770,7 +780,6 @@ class ModelViewerWidget(QWidget):
 
         dir_group = QGroupBox("Build Direction")
         dir_grid = QGridLayout(dir_group)
-        dir_grid.setSpacing(3)
         for col, (label, vec) in enumerate([
             ("+X", (1, 0, 0)), ("-X", (-1, 0, 0)),
             ("+Y", (0, 1, 0)), ("-Y", (0, -1, 0)),
@@ -778,7 +787,6 @@ class ModelViewerWidget(QWidget):
         ]):
             row, c = divmod(col, 2)
             btn = QPushButton(label)
-            btn.setFixedHeight(24)
             btn.clicked.connect(lambda _chk, v=vec: self._set_build_dir(v))
             dir_grid.addWidget(btn, row, c)
         layout.addWidget(dir_group)
@@ -853,7 +861,8 @@ class ModelViewerWidget(QWidget):
     def _init_vtk(self) -> None:
         """Finalise VTK initialisation after the widget is shown."""
         try:
-            self._vtk_widget._Iren.Initialize()
+            iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+            iren.Initialize()
             self._vtk_widget.GetRenderWindow().Render()
         except Exception:
             logger.exception("VTK initialisation failed")
@@ -1131,8 +1140,19 @@ class ModelViewerWidget(QWidget):
             return
         if checked:
             self._actor.GetProperty().SetRepresentationToWireframe()
+            self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
+                "line-icons:box-3-line.svg"),
+                                                         self.palette(
+
+                                                         ).highlightedText(
+
+                                                         ).color())))
         else:
             self._actor.GetProperty().SetRepresentationToSurface()
+            self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
+                "line-icons:global-line.svg"), self.palette().highlightedText(
+
+            ).color())))
         self._vtk_widget.GetRenderWindow().Render()
 
     def _choose_background(self) -> None:

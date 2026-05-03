@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------------
 # Standalone entry-point
 # ---------------------------------------------------------------------------
+import os
+os.environ["VTK_RENDERER"] = "Software"
 import logging
 import sys
 
