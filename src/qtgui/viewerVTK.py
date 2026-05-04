@@ -637,25 +637,12 @@ class _WallThicknessWorker(QThread):
 
 
 class LightingDialog(QDialog):
-    """Non‑blocking dialog for live adjustment of actor lighting properties."""
-
-    def __init__(self, actor: vtkActor, render_window, parent=None) -> None:
-        """Initialise the dialog with the target actor and render window.
-
-        Parameters
-        ----------
-        actor : vtkActor
-            The actor whose lighting properties can be adjusted.
-        render_window : vtkRenderWindow
-            The render window to refresh after changes.
-        parent : QWidget, optional
-            Parent widget.
-        """
+    def __init__(self, actor: vtkActor, render_callback=None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Lighting Controls")
         self.setFixedSize(320, 185)
         self._actor = actor
-        self._rw = render_window
+        self._render = render_callback if render_callback else (lambda: None)
 
         layout = QGridLayout(self)
         specs = [
@@ -680,12 +667,11 @@ class LightingDialog(QDialog):
         layout.addWidget(buttons, len(specs), 0, 1, 2)
 
     def _apply(self) -> None:
-        """Transfer spinbox values to the actor and re-render."""
         prop = self._actor.GetProperty()
         prop.SetAmbient(self._spinboxes["ambient"].value())
         prop.SetDiffuse(self._spinboxes["diffuse"].value())
         prop.SetSpecular(self._spinboxes["specular"].value())
-        self._rw.Render()
+        self._render()  # uses the callback to update the off‑screen widget
 
 
 class StatisticsDialog(QDialog):
@@ -781,6 +767,465 @@ class StatisticsDialog(QDialog):
         return "\n".join(lines)
 
 
+import os
+import math
+from collections import deque
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPixmap
+from PyQt6.QtWidgets import (
+    QButtonGroup, QColorDialog, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QGroupBox, QLabel, QPushButton, QRadioButton, QSlider, QSpinBox,
+    QSplitter, QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+)
+from vtkmodules.vtkCommonColor import vtkNamedColors
+from vtkmodules.vtkCommonCore import vtkLookupTable, vtkMath
+from vtkmodules.vtkCommonDataModel import vtkPolyData
+from vtkmodules.vtkFiltersCore import (
+    vtkAppendPolyData,  vtkCutter, vtkFeatureEdges,
+    vtkTriangleFilter,
+)
+from vtkmodules.vtkFiltersSources import vtkPlaneSource
+from vtkmodules.vtkIOImage import vtkPNGWriter
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
+from vtkmodules.vtkRenderingAnnotation import vtkAxesActor, vtkCubeAxesActor, vtkScalarBarActor
+from vtkmodules.vtkRenderingCore import (
+    vtkActor, vtkPolyDataMapper, vtkRenderer, vtkWindowToImageFilter,
+)
+from vtkmodules.vtkRenderingOpenGL2 import vtkOpenGLRenderer
+from vtkmodules.util.numpy_support import numpy_to_vtk
+
+_NAMED_COLORS = vtkNamedColors()
+logger = logging.getLogger(__name__)
+
+
+class _UndoManager:
+    """Manages undo/redo stacks using scene snapshots."""
+
+    def __init__(self, maxlen: int):
+        self._undo_stack: deque[dict] = deque(maxlen=maxlen)
+        self._redo_stack: deque[dict] = deque(maxlen=maxlen)
+
+    def push(self, snapshot: dict) -> None:
+        """Store a snapshot and clear the redo stack."""
+        self._undo_stack.append(snapshot)
+        self._redo_stack.clear()
+
+    def undo(self, current_snapshot: dict) -> Optional[dict]:
+        """Pop from undo stack, push current on redo, return snapshot to restore."""
+        if not self._undo_stack:
+            return None
+        self._redo_stack.append(current_snapshot)
+        return self._undo_stack.pop()
+
+    def redo(self, current_snapshot: dict) -> Optional[dict]:
+        """Pop from redo stack, push current on undo, return snapshot to restore."""
+        if not self._redo_stack:
+            return None
+        self._undo_stack.append(current_snapshot)
+        return self._redo_stack.pop()
+
+    @property
+    def undo_stack(self) -> deque:
+        return self._undo_stack
+
+    @property
+    def redo_stack(self) -> deque:
+        return self._redo_stack
+
+    def clear(self) -> None:
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+
+class _VTKViewport:
+    """Encapsulates VTK rendering: renderer, camera, orientation marker, grid."""
+
+    def __init__(self, vtk_widget: OffscreenVTKWidget):
+        self._vtk_widget = vtk_widget
+        self._renderer: Optional[vtkRenderer] = None
+        self._ori_marker: Optional[vtkOrientationMarkerWidget] = None
+        self._cube_axes: Optional[vtkCubeAxesActor] = None
+        self._grid_visible = False
+
+    def initialize(self) -> None:
+        ren = vtkRenderer()
+        self._vtk_widget.GetRenderWindow().AddRenderer(ren)
+        ren.SetBackground(_NAMED_COLORS.GetColor3d("SlateGray"))
+        self._renderer = ren
+
+        style = vtkInteractorStyleTrackballCamera()
+        self._vtk_widget._Iren.SetInteractorStyle(style)
+
+        axes = vtkAxesActor()
+        self._ori_marker = vtkOrientationMarkerWidget()
+        self._ori_marker.SetInteractor(self._vtk_widget._Iren)
+        self._ori_marker.SetOrientationMarker(axes)
+        self._ori_marker.SetEnabled(1)
+        self._ori_marker.InteractiveOn()
+        self._update_image()
+
+    @property
+    def renderer(self) -> vtkRenderer:
+        return self._renderer
+
+    @property
+    def widget(self) -> OffscreenVTKWidget:
+        return self._vtk_widget
+
+    def _update_image(self) -> None:
+        self._vtk_widget._update_image()
+
+    def add_actor(self, actor: vtkActor) -> None:
+        self._renderer.AddActor(actor)
+
+    def remove_actor(self, actor: vtkActor) -> None:
+        self._renderer.RemoveActor(actor)
+
+    def add_actor2d(self, actor) -> None:
+        self._renderer.AddActor2D(actor)
+
+    def remove_actor2d(self, actor) -> None:
+        self._renderer.RemoveActor2D(actor)
+
+    def reset_camera(self) -> None:
+        if self._cube_axes is not None:
+            self._cube_axes.SetCamera(self._renderer.GetActiveCamera())
+        self._renderer.ResetCamera()
+        self._renderer.ResetCameraClippingRange()
+        self._update_image()
+
+    def set_background(self, r: float, g: float, b: float) -> None:
+        self._renderer.SetBackground(r, g, b)
+        self._update_image()
+
+    def get_background(self) -> Tuple[float, float, float]:
+        return self._renderer.GetBackground()
+
+    def show_grid(self, visible: bool) -> None:
+        self._grid_visible = visible
+        if self._cube_axes is not None:
+            self._cube_axes.SetVisibility(visible)
+            self._update_image()
+
+    def update_grid(self, polydata: vtkPolyData) -> None:
+        if polydata is None:
+            return
+        bounds = polydata.GetBounds()
+        camera = self._renderer.GetActiveCamera()
+        if self._cube_axes is None:
+            ca = vtkCubeAxesActor()
+            ca.SetFlyModeToOuterEdges()
+            ca.SetCamera(camera)
+            ca.SetXAxisLabelVisibility(True)
+            ca.SetYAxisLabelVisibility(True)
+            ca.SetZAxisLabelVisibility(True)
+            ca.SetXAxisTickVisibility(True)
+            ca.SetYAxisTickVisibility(True)
+            ca.SetZAxisTickVisibility(True)
+            ca.SetLabelScaling(False, False, False, False)
+            ca.GetXAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
+            ca.GetYAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
+            ca.GetZAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
+            self._renderer.AddActor(ca)
+            self._cube_axes = ca
+        else:
+            self._cube_axes.SetCamera(camera)
+        self._cube_axes.SetBounds(bounds)
+        self._cube_axes.SetVisibility(self._grid_visible)
+
+    def remove_cube_axes(self) -> None:
+        if self._cube_axes is not None:
+            self._renderer.RemoveActor(self._cube_axes)
+            self._cube_axes = None
+
+    def cleanup(self) -> None:
+        if self._ori_marker:
+            self._ori_marker.SetEnabled(0)
+            self._ori_marker.SetInteractor(None)
+        self.remove_cube_axes()
+        self._renderer.RemoveAllViewProps()
+        self._renderer.Clear()
+        self._vtk_widget.Finalize()
+        self._renderer = None
+        self._ori_marker = None
+
+    def render(self) -> None:
+        self._update_image()
+
+
+class ModelToolBar(QToolBar):
+    """Toolbar for the model viewer, emitting high‑level signals."""
+
+    openRequested = pyqtSignal()
+    exportRequested = pyqtSignal()
+    resetCameraRequested = pyqtSignal()
+    wireframeToggled = pyqtSignal(bool)
+    gridToggled = pyqtSignal(bool)
+    backgroundChangeRequested = pyqtSignal()
+    lightingRequested = pyqtSignal()
+    statisticsRequested = pyqtSignal()
+    screenshotRequested = pyqtSignal()
+    undoRequested = pyqtSignal()
+    redoRequested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__("Main Toolbar", parent)
+        self._status_label = QLabel("Ready")
+        self._wire_btn = QToolButton()
+        self._grid_btn = QToolButton()
+        self._build_ui()
+
+    def _build_ui(self):
+        # Helper to create a tool button
+        def _btn(label, slot, icon_path):
+            b = QToolButton()
+            b.setToolTip(label)
+            b.setIcon(QIcon(colorize_pixmap(QPixmap(icon_path),
+                                            self.palette().highlightedText().color())))
+            b.clicked.connect(slot)
+            self.addWidget(b)
+            return b
+
+        _btn("Open", self.openRequested.emit, "line-icons:file-add-line.svg")
+        _btn("Export", self.exportRequested.emit, "line-icons:export-line.svg")
+        self.addSeparator()
+        _btn("Reset Camera", self.resetCameraRequested.emit, "line-icons:camera-switch-line.svg")
+
+        self._wire_btn.setCheckable(True)
+        self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap("line-icons:global-line.svg"),
+                                                     self.palette().highlightedText().color())))
+        self._wire_btn.setToolTip("Toggle wireframe/solid")
+        self._wire_btn.toggled.connect(self.wireframeToggled.emit)
+        self.addWidget(self._wire_btn)
+
+        self._grid_btn.setCheckable(True)
+        self._grid_btn.setIcon(QIcon(colorize_pixmap(QPixmap("line-icons:grid-line.svg"),
+                                                     self.palette().highlightedText().color())))
+        self._grid_btn.setToolTip("Toggle bounding-box grid")
+        self._grid_btn.toggled.connect(self.gridToggled.emit)
+        self.addWidget(self._grid_btn)
+
+        _btn("Background", self.backgroundChangeRequested.emit, "line-icons:multi-image-line.svg")
+        self.addSeparator()
+        _btn("Lighting", self.lightingRequested.emit, "line-icons:lightbulb-line.svg")
+        _btn("Statistics", self.statisticsRequested.emit, "line-icons:donut-chart-line.svg")
+        _btn("Screenshot", self.screenshotRequested.emit, "line-icons:camera-lens-line.svg")
+        self.addSeparator()
+        _btn("Undo", self.undoRequested.emit, "line-icons:arrow-go-back-line.svg")
+        _btn("Redo", self.redoRequested.emit, "line-icons:arrow-go-forward-line.svg")
+        self.addSeparator()
+        self.addWidget(self._status_label)
+
+    @property
+    def wire_btn(self) -> QToolButton:
+        return self._wire_btn
+
+    @property
+    def grid_btn(self) -> QToolButton:
+        return self._grid_btn
+
+    @property
+    def status_label(self) -> QLabel:
+        return self._status_label
+
+
+class AnalysisPanel(QWidget):
+    """Right‑hand analysis panel. Exposes child widgets for backward compatibility."""
+
+    modeChanged = pyqtSignal(object)          # AnalysisMode
+    buildDirectionChanged = pyqtSignal(tuple)  # (x, y, z)
+    overhangThresholdChanged = pyqtSignal()
+    layerThicknessChanged = pyqtSignal(int)
+    layerSliderChanged = pyqtSignal(int)
+    minWallChanged = pyqtSignal()
+    meshCheckRequested = pyqtSignal()
+    modeRadioButtons: Dict[AnalysisMode, QRadioButton]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(240)
+        self.modeChanged.connect(lambda _: None)
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Build helpers (each creates one logical group)
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        """Assemble the panel from individual groups."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        layout.addWidget(self._build_analysis_mode_group())
+        layout.addWidget(self._build_direction_group())
+        layout.addWidget(self._build_overhang_group())
+        layout.addWidget(self._build_layer_group())
+        layout.addWidget(self._build_wall_group())
+        layout.addWidget(self._build_mesh_group())
+        layout.addStretch()
+
+    def _build_analysis_mode_group(self) -> QGroupBox:
+        group = QGroupBox("Analysis Mode")
+        mode_layout = QVBoxLayout(group)
+        mode_layout.setSpacing(10)
+        self._mode_btn_group = QButtonGroup(self)
+        self.modeRadioButtons = {}
+        for label, mode in [
+            ("None", AnalysisMode.NONE),
+            ("Overhang Heat Map", AnalysisMode.OVERHANG),
+            ("Wall Thickness", AnalysisMode.WALL),
+            ("Layer Preview", AnalysisMode.LAYER),
+            ("Support Estimate", AnalysisMode.SUPPORT),
+        ]:
+            rb = QRadioButton(label)
+            if mode == AnalysisMode.NONE:
+                rb.setChecked(True)
+            self._mode_btn_group.addButton(rb)
+            mode_layout.addWidget(rb)
+            rb.clicked.connect(lambda checked, m=mode: self.modeChanged.emit(m))
+            self.modeRadioButtons[mode] = rb
+        return group
+
+    def _build_direction_group(self) -> QGroupBox:
+        group = QGroupBox("Build Direction")
+        dir_grid = QGridLayout(group)
+        self._dir_button_group = QButtonGroup(self)
+        self._dir_button_group.setExclusive(True)
+        self._dir_buttons = {}
+        directions = [
+            ("+X", (1, 0, 0)), ("-X", (-1, 0, 0)),
+            ("+Y", (0, 1, 0)), ("-Y", (0, -1, 0)),
+            ("+Z", (0, 0, 1)), ("-Z", (0, 0, -1)),
+        ]
+        for col, (dlbl, vec) in enumerate(directions):
+            row, c = divmod(col, 2)
+            btn = QPushButton(dlbl)
+            btn.setCheckable(True)
+            self._dir_button_group.addButton(btn)
+            self._dir_buttons[vec] = btn
+            dir_grid.addWidget(btn, row, c)
+        self._dir_button_group.buttonClicked.connect(self._on_dir_button_clicked)
+        default_dir = (0, 0, 1)
+        if default_dir in self._dir_buttons:
+            self._dir_buttons[default_dir].setChecked(True)
+        return group
+
+    def _build_overhang_group(self) -> QGroupBox:
+        group = QGroupBox("Overhang Settings")
+        oh_layout = QGridLayout(group)
+        oh_layout.addWidget(QLabel("Threshold (deg):"), 0, 0)
+        self._overhang_spin = QDoubleSpinBox()
+        self._overhang_spin.setRange(1.0, 89.0)
+        self._overhang_spin.setValue(45.0)
+        self._overhang_spin.setSingleStep(5.0)
+        self._overhang_spin.setDecimals(1)
+        self._overhang_spin.valueChanged.connect(self.overhangThresholdChanged.emit)
+        oh_layout.addWidget(self._overhang_spin, 0, 1)
+        return group
+
+    def _build_layer_group(self) -> QGroupBox:
+        group = QGroupBox("Layer Preview")
+        layer_layout = QGridLayout(group)
+        layer_layout.addWidget(QLabel("Thickness (um):"), 0, 0)
+        self._layer_thickness_spin = QSpinBox()
+        self._layer_thickness_spin.setRange(10, 500)
+        self._layer_thickness_spin.setValue(50)
+        self._layer_thickness_spin.setSuffix(" um")
+        self._layer_thickness_spin.valueChanged.connect(
+            lambda v: self.layerThicknessChanged.emit(v))
+        layer_layout.addWidget(self._layer_thickness_spin, 0, 1)
+
+        self._layer_slider = QSlider(Qt.Orientation.Horizontal)
+        self._layer_slider.setRange(0, 0)
+        self._layer_slider.setValue(0)
+        self._layer_slider.valueChanged.connect(self.layerSliderChanged.emit)
+        layer_layout.addWidget(self._layer_slider, 1, 0, 1, 2)
+
+        self._layer_info_label = QLabel("Layer: - / -")
+        layer_layout.addWidget(self._layer_info_label, 2, 0, 1, 2)
+        self._layer_area_label = QLabel("Area: -")
+        layer_layout.addWidget(self._layer_area_label, 3, 0, 1, 2)
+        return group
+
+    def _build_wall_group(self) -> QGroupBox:
+        group = QGroupBox("Wall Thickness")
+        wall_layout = QGridLayout(group)
+        wall_layout.addWidget(QLabel("Min target (mm):"), 0, 0)
+        self._min_wall_spin = QDoubleSpinBox()
+        self._min_wall_spin.setRange(0.01, 50.0)
+        self._min_wall_spin.setValue(0.5)
+        self._min_wall_spin.setDecimals(2)
+        self._min_wall_spin.setSingleStep(0.1)
+        self._min_wall_spin.valueChanged.connect(self.minWallChanged.emit)
+        wall_layout.addWidget(self._min_wall_spin, 0, 1)
+        self._wall_progress_label = QLabel("")
+        wall_layout.addWidget(self._wall_progress_label, 1, 0, 1, 2)
+        return group
+
+    def _build_mesh_group(self) -> QGroupBox:
+        group = QGroupBox("Mesh Integrity")
+        mesh_layout = QVBoxLayout(group)
+        run_btn = QPushButton("Run Check")
+        run_btn.clicked.connect(self.meshCheckRequested.emit)
+        mesh_layout.addWidget(run_btn)
+        self._mesh_result_edit = QTextEdit()
+        self._mesh_result_edit.setReadOnly(True)
+        self._mesh_result_edit.setMaximumHeight(110)
+        self._mesh_result_edit.setPlainText("-")
+        mesh_layout.addWidget(self._mesh_result_edit)
+        return group
+
+    # ------------------------------------------------------------------
+    # Internal logic
+    # ------------------------------------------------------------------
+    def _on_dir_button_clicked(self, button: QPushButton) -> None:
+        """Emit the build direction when a direction button is clicked."""
+        for vec, btn in self._dir_buttons.items():
+            if btn is button:
+                self.buildDirectionChanged.emit(vec)
+                return
+
+    # ------------------------------------------------------------------
+    # Backward‑compatible property access
+    # ------------------------------------------------------------------
+    @property
+    def overhang_spin(self) -> QDoubleSpinBox:
+        return self._overhang_spin
+
+    @property
+    def layer_thickness_spin(self) -> QSpinBox:
+        return self._layer_thickness_spin
+
+    @property
+    def layer_slider(self) -> QSlider:
+        return self._layer_slider
+
+    @property
+    def layer_info_label(self) -> QLabel:
+        return self._layer_info_label
+
+    @property
+    def layer_area_label(self) -> QLabel:
+        return self._layer_area_label
+
+    @property
+    def min_wall_spin(self) -> QDoubleSpinBox:
+        return self._min_wall_spin
+
+    @property
+    def wall_progress_label(self) -> QLabel:
+        return self._wall_progress_label
+
+    @property
+    def mesh_result_edit(self) -> QTextEdit:
+        return self._mesh_result_edit
+
+
 class ModelViewerWidget(QWidget):
     """Embeddable PyQt6 widget for interactive 3‑D model viewing.
 
@@ -798,23 +1243,17 @@ class ModelViewerWidget(QWidget):
     _MAX_HISTORY: int = 20
 
     def __init__(self, parent=None) -> None:
-        """Construct the viewer widget.
-
-        Parameters
-        ----------
-        parent : QWidget, optional
-            Parent widget.
-        """
         super().__init__(parent)
-
         self._actor: Optional[vtkActor] = None
         self._mapper: Optional[vtkPolyDataMapper] = None
         self._plain_mapper: Optional[vtkPolyDataMapper] = None
         self._source_poly: Optional[vtkPolyData] = None
         self._current_file: Optional[str] = None
 
-        self._undo_stack: deque = deque(maxlen=self._MAX_HISTORY)
-        self._redo_stack: deque = deque(maxlen=self._MAX_HISTORY)
+        self._undo_manager = _UndoManager(self._MAX_HISTORY)
+        # Backward compatibility: expose the undo stacks
+        self._undo_stack = self._undo_manager.undo_stack
+        self._redo_stack = self._undo_manager.redo_stack
 
         self._am_mode: AnalysisMode = AnalysisMode.NONE
         self._build_dir: Tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -826,271 +1265,106 @@ class ModelViewerWidget(QWidget):
         self._grid_visible: bool = False
         self._cube_axes: Optional[vtkCubeAxesActor] = None
 
-        # Renderer and interactor will be set up in _init_vtk
+        self._viewport: Optional[_VTKViewport] = None
         self._renderer: Optional[vtkRenderer] = None
         self._ori_marker: Optional[vtkOrientationMarkerWidget] = None
 
         self._setup_ui()
         QTimer.singleShot(500, self._init_vtk)
 
+    # ----------------------------------------------------------------------
+    # UI construction (delegated to sub‑widgets but keeping backward‑compat)
+    # ----------------------------------------------------------------------
     def _setup_ui(self) -> None:
-        """Build the full user interface: toolbar, VTK viewport, and AM panel."""
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(2)
 
-        toolbar = QToolBar("Main Toolbar")
-        root.addWidget(toolbar)
+        self._toolbar = ModelToolBar(self)
+        root.addWidget(self._toolbar)
 
-        def _btn(label: str, slot, icon: Optional[str] = None) -> QToolButton:
-            b = QToolButton()
-            b.setToolTip(label)
-            if icon:
-                b.setIcon(
-                    QIcon(
-                        colorize_pixmap(
-                            QPixmap(icon),
-                            self.palette().highlightedText().color()
-                        )
-                    )
-                )
-            b.clicked.connect(slot)
-            toolbar.addWidget(b)
-            return b
+        self._toolbar.openRequested.connect(self.open_file)
+        self._toolbar.exportRequested.connect(self._show_export_dialog)
+        self._toolbar.resetCameraRequested.connect(self.reset_camera)
+        self._toolbar.wireframeToggled.connect(self._toggle_wireframe)
+        self._toolbar.gridToggled.connect(self.toggle_grid)
+        self._toolbar.backgroundChangeRequested.connect(self._choose_background)
+        self._toolbar.lightingRequested.connect(self._show_lighting_dialog)
+        self._toolbar.statisticsRequested.connect(self._show_statistics_dialog)
+        self._toolbar.screenshotRequested.connect(self._screenshot)
+        self._toolbar.undoRequested.connect(self.undo)
+        self._toolbar.redoRequested.connect(self.redo)
 
-        _btn("Open", self.open_file, icon="line-icons:file-add-line.svg")
-        _btn("Export", self._show_export_dialog,
-             icon="line-icons:export-line.svg")
-        toolbar.addSeparator()
-        _btn("Reset Camera", self.reset_camera,
-             icon="line-icons:camera-switch-line.svg")
-
-        self._wire_btn = QToolButton()
-        self._wire_btn.setCheckable(True)
-        self._wire_btn.setIcon(
-            QIcon(colorize_pixmap(QPixmap("line-icons:global-line.svg"),
-                                  self.palette().highlightedText().color())))
-        self._wire_btn.setToolTip("Toggle wireframe/solid")
-        self._wire_btn.toggled.connect(self._toggle_wireframe)
-        toolbar.addWidget(self._wire_btn)
-
-        self._grid_btn = QToolButton()
-        self._grid_btn.setCheckable(True)
-        self._grid_btn.setIcon(
-            QIcon(colorize_pixmap(QPixmap("line-icons:grid-line.svg"),
-                                  self.palette().highlightedText().color())))
-        self._grid_btn.setToolTip("Toggle bounding-box grid")
-        self._grid_btn.toggled.connect(self.toggle_grid)
-        toolbar.addWidget(self._grid_btn)
-
-        _btn("Background", self._choose_background,
-             icon="line-icons:multi-image-line.svg")
-        toolbar.addSeparator()
-        _btn("Lighting", self._show_lighting_dialog,
-             icon="line-icons:lightbulb-line.svg")
-        _btn("Statistics", self._show_statistics_dialog,
-             icon="line-icons:donut-chart-line.svg")
-        _btn("Screenshot", self._screenshot,
-             icon="line-icons:camera-lens-line.svg")
-        toolbar.addSeparator()
-        _btn("Undo", self.undo,
-             icon="line-icons:arrow-go-back-line.svg")
-        _btn("Redo", self.redo,
-             icon="line-icons:arrow-go-forward-line.svg")
-        toolbar.addSeparator()
-
-        self._status_label = QLabel("Ready")
-        toolbar.addWidget(self._status_label)
+        # Expose buttons and status label for backward compatibility
+        self._wire_btn = self._toolbar.wire_btn
+        self._grid_btn = self._toolbar.grid_btn
+        self._status_label = self._toolbar.status_label
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
-        # Use the off‑screen widget instead of SafeVTKWidget
         self._vtk_widget = OffscreenVTKWidget(self)
+        self._viewport = _VTKViewport(self._vtk_widget)
         splitter.addWidget(self._vtk_widget)
 
-        am_panel = self._build_am_panel()
-        splitter.addWidget(am_panel)
+        self._am_panel = AnalysisPanel(self)
+        splitter.addWidget(self._am_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([1000, 240])
 
-        # VTK renderer, style, and orientation marker will be set in _init_vtk
+        # Connect analysis panel signals
+        self._am_panel.modeChanged.connect(
+            lambda m: self._set_analysis_mode(m))
+        self._am_panel.buildDirectionChanged.connect(self._set_build_dir)
+        self._am_panel.overhangThresholdChanged.connect(
+            lambda: self._refresh_analysis_if(AnalysisMode.OVERHANG))
+        self._am_panel.layerThicknessChanged.connect(self._rebuild_layer_slider)
+        self._am_panel.layerSliderChanged.connect(self._update_layer_preview)
+        self._am_panel.minWallChanged.connect(
+            lambda: self._set_analysis_mode(AnalysisMode.WALL))
+        self._am_panel.meshCheckRequested.connect(self._run_mesh_check)
+
+        # Backward compatibility: assign panel child widgets to self
+        self._overhang_spin = self._am_panel.overhang_spin
+        self._layer_thickness_spin = self._am_panel.layer_thickness_spin
+        self._layer_slider = self._am_panel.layer_slider
+        self._layer_info_label = self._am_panel.layer_info_label
+        self._layer_area_label = self._am_panel.layer_area_label
+        self._min_wall_spin = self._am_panel.min_wall_spin
+        self._wall_progress_label = self._am_panel.wall_progress_label
+        self._mesh_result_edit = self._am_panel.mesh_result_edit
+        self._mode_radio = self._am_panel.modeRadioButtons
+
         self.setAcceptDrops(True)
 
-    def _build_am_panel(self) -> QWidget:
-        """Construct the right-hand analysis panel with all controls.
-
-        Returns
-        -------
-        QWidget
-            The configured panel widget.
-        """
-        panel = QWidget()
-        panel.setFixedWidth(240)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
-
-        mode_group = QGroupBox("Analysis Mode")
-        mode_layout = QVBoxLayout(mode_group)
-        mode_layout.setSpacing(10)
-        self._mode_btn_group = QButtonGroup(self)
-        self._mode_radio: Dict[AnalysisMode, QRadioButton] = {}
-        for label, mode in [
-            ("None", AnalysisMode.NONE),
-            ("Overhang Heat Map", AnalysisMode.OVERHANG),
-            ("Wall Thickness", AnalysisMode.WALL),
-            ("Layer Preview", AnalysisMode.LAYER),
-            ("Support Estimate", AnalysisMode.SUPPORT),
-        ]:
-            rb = QRadioButton(label)
-            if mode == AnalysisMode.NONE:
-                rb.setChecked(True)
-            self._mode_btn_group.addButton(rb)
-            mode_layout.addWidget(rb)
-            rb.clicked.connect(lambda _chk, m=mode: self._set_analysis_mode(m))
-            self._mode_radio[mode] = rb
-        layout.addWidget(mode_group)
-
-        dir_group = QGroupBox("Build Direction")
-        dir_grid = QGridLayout(dir_group)
-        for col, (label, vec) in enumerate([
-            ("+X", (1, 0, 0)), ("-X", (-1, 0, 0)),
-            ("+Y", (0, 1, 0)), ("-Y", (0, -1, 0)),
-            ("+Z", (0, 0, 1)), ("-Z", (0, 0, -1)),
-        ]):
-            row, c = divmod(col, 2)
-            btn = QPushButton(label)
-            btn.clicked.connect(lambda _chk, v=vec: self._set_build_dir(v))
-            dir_grid.addWidget(btn, row, c)
-        layout.addWidget(dir_group)
-
-        oh_group = QGroupBox("Overhang Settings")
-        oh_layout = QGridLayout(oh_group)
-        oh_layout.addWidget(QLabel("Threshold (deg):"), 0, 0)
-        self._overhang_spin = QDoubleSpinBox()
-        self._overhang_spin.setRange(1.0, 89.0)
-        self._overhang_spin.setValue(45.0)
-        self._overhang_spin.setSingleStep(5.0)
-        self._overhang_spin.setDecimals(1)
-        self._overhang_spin.valueChanged.connect(
-            lambda _: self._refresh_analysis_if(AnalysisMode.OVERHANG)
-        )
-        oh_layout.addWidget(self._overhang_spin, 0, 1)
-        layout.addWidget(oh_group)
-
-        layer_group = QGroupBox("Layer Preview")
-        layer_layout = QGridLayout(layer_group)
-        layer_layout.addWidget(QLabel("Thickness (um):"), 0, 0)
-        self._layer_thickness_spin = QSpinBox()
-        self._layer_thickness_spin.setRange(10, 500)
-        self._layer_thickness_spin.setValue(50)
-        self._layer_thickness_spin.setSuffix(" um")
-        self._layer_thickness_spin.valueChanged.connect(
-            lambda _: self._rebuild_layer_slider()
-        )
-        layer_layout.addWidget(self._layer_thickness_spin, 0, 1)
-
-        self._layer_slider = QSlider(Qt.Orientation.Horizontal)
-        self._layer_slider.setRange(0, 0)
-        self._layer_slider.setValue(0)
-        self._layer_slider.valueChanged.connect(self._update_layer_preview)
-        layer_layout.addWidget(self._layer_slider, 1, 0, 1, 2)
-
-        self._layer_info_label = QLabel("Layer: - / -")
-        layer_layout.addWidget(self._layer_info_label, 2, 0, 1, 2)
-
-        self._layer_area_label = QLabel("Area: -")
-        layer_layout.addWidget(self._layer_area_label, 3, 0, 1, 2)
-        layout.addWidget(layer_group)
-
-        wall_group = QGroupBox("Wall Thickness")
-        wall_layout = QGridLayout(wall_group)
-        wall_layout.addWidget(QLabel("Min target (mm):"), 0, 0)
-        self._min_wall_spin = QDoubleSpinBox()
-        self._min_wall_spin.setRange(0.01, 50.0)
-        self._min_wall_spin.setValue(0.5)
-        self._min_wall_spin.setDecimals(2)
-        self._min_wall_spin.setSingleStep(0.1)
-        wall_layout.addWidget(self._min_wall_spin, 0, 1)
-        self._wall_progress_label = QLabel("")
-        wall_layout.addWidget(self._wall_progress_label, 1, 0, 1, 2)
-        layout.addWidget(wall_group)
-
-        mesh_group = QGroupBox("Mesh Integrity")
-        mesh_layout = QVBoxLayout(mesh_group)
-        run_btn = QPushButton("Run Check")
-        run_btn.clicked.connect(self._run_mesh_check)
-        mesh_layout.addWidget(run_btn)
-        self._mesh_result_edit = QTextEdit()
-        self._mesh_result_edit.setReadOnly(True)
-        self._mesh_result_edit.setMaximumHeight(110)
-        self._mesh_result_edit.setPlainText("-")
-        mesh_layout.addWidget(self._mesh_result_edit)
-        layout.addWidget(mesh_group)
-
-        layout.addStretch()
-        return panel
-
+    # ----------------------------------------------------------------------
+    # VTK initialization (delegated to viewport)
+    # ----------------------------------------------------------------------
     def _init_vtk(self) -> None:
-        """Finalise VTK initialisation after the widget is shown."""
         try:
-            # Create renderer and attach it to the already‑existing render window
-            self._renderer = vtkRenderer()
-            self._vtk_widget.GetRenderWindow().AddRenderer(self._renderer)
-
-            # Set background colour (SlateGray)
-            colors = vtkNamedColors()
-            self._renderer.SetBackground(colors.GetColor3d("SlateGray"))
-
-            # Set the interactor style
-            style = vtkInteractorStyleTrackballCamera()
-            self._vtk_widget._Iren.SetInteractorStyle(style)
-
-            # Orientation marker
-            axes = vtkAxesActor()
-            self._ori_marker = vtkOrientationMarkerWidget()
-            self._ori_marker.SetInteractor(self._vtk_widget._Iren)
-            self._ori_marker.SetOrientationMarker(axes)
-            self._ori_marker.SetEnabled(1)
-            self._ori_marker.InteractiveOn()
-
-            # Trigger the very first render and display
-            self._vtk_widget._update_image()
+            self._viewport.initialize()
+            self._renderer = self._viewport.renderer
+            self._ori_marker = self._viewport._ori_marker
+            self._cube_axes = self._viewport._cube_axes
+            # Ensure internal state syncs
+            self._grid_visible = False
         except Exception:
             logger.exception("VTK initialisation failed")
             self._set_status("VTK initialisation failed -- see log")
 
+    # ----------------------------------------------------------------------
+    # Status and snapshot helpers (unchanged logic)
+    # ----------------------------------------------------------------------
     def _set_status(self, message: str) -> None:
-        """Update the status bar label and log the message.
-
-        Parameters
-        ----------
-        message : str
-            The status text to display and log.
-        """
         self._status_label.setText(message)
         logger.debug("status: %s", message)
 
     def _snapshot(self, action: str) -> dict:
-        """Create a serialisable snapshot of the current scene state.
-
-        Parameters
-        ----------
-        action : str
-            A label describing the action that prompted the snapshot
-            (e.g. "Load model").
-
-        Returns
-        -------
-        dict
-            Dictionary containing all relevant scene state.
-        """
         snap: dict = {
             "action": action,
             "file": self._current_file,
-            "background": tuple(self._renderer.GetBackground()) if self._renderer else (),
+            "background": tuple(self._viewport.get_background()) if self._viewport else (),
             "wireframe": self._wire_btn.isChecked(),
             "grid": self._grid_visible,
             "am_mode": self._am_mode.value,
@@ -1101,20 +1375,13 @@ class ModelViewerWidget(QWidget):
         return snap
 
     def _restore_snapshot(self, snap: dict) -> None:
-        """Restore the scene from a snapshot.
-
-        Parameters
-        ----------
-        snap : dict
-            A snapshot dictionary as produced by ``_snapshot``.
-        """
         if snap["file"]:
             self.load_model(snap["file"], add_undo=False)
         else:
             self._clear_actor()
 
-        if self._renderer and "background" in snap:
-            self._renderer.SetBackground(*snap["background"])
+        if "background" in snap:
+            self._viewport.set_background(*snap["background"])
 
         if self._actor is not None and "actor_props" in snap:
             _apply_actor_props(self._actor, snap["actor_props"])
@@ -1128,52 +1395,51 @@ class ModelViewerWidget(QWidget):
         self._build_dir = snap.get("build_dir", (0.0, 0.0, 1.0))
         am_mode_str = snap.get("am_mode", AnalysisMode.NONE.value)
         self._set_analysis_mode(AnalysisMode(am_mode_str))
-        self._vtk_widget._update_image()
+        self._viewport.render()
 
     def _push_undo(self, action: str) -> None:
-        """Push a snapshot onto the undo stack and clear the redo stack.
+        self._undo_manager.push(self._snapshot(action))
 
-        Parameters
-        ----------
-        action : str
-            The action label for the undo snapshot.
-        """
-        self._undo_stack.append(self._snapshot(action))
-        self._redo_stack.clear()
-
+    # ----------------------------------------------------------------------
+    # Undo / Redo (delegates to manager)
+    # ----------------------------------------------------------------------
     def undo(self) -> None:
-        """Undo the last action, if any."""
-        if not self._undo_stack:
+        current = self._snapshot("undo")
+        snap = self._undo_manager.undo(current)
+        if snap is None:
             self._set_status("Nothing to undo.")
             return
-        self._redo_stack.append(self._snapshot("undo"))
-        self._restore_snapshot(self._undo_stack.pop())
+        self._restore_snapshot(snap)
         self._set_status("Undone.")
 
     def redo(self) -> None:
-        """Redo the last undone action, if any."""
-        if not self._redo_stack:
+        current = self._snapshot("redo")
+        snap = self._undo_manager.redo(current)
+        if snap is None:
             self._set_status("Nothing to redo.")
             return
-        self._undo_stack.append(self._snapshot("redo"))
-        self._restore_snapshot(self._redo_stack.pop())
+        self._restore_snapshot(snap)
         self._set_status("Redone.")
 
+    # ----------------------------------------------------------------------
+    # Drag & drop (unchanged)
+    # ----------------------------------------------------------------------
     def dragEnterEvent(self, event) -> None:
-        """Accept drag events that contain file URLs."""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        """Load the first dropped file URL."""
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path:
                 self.load_model(path)
                 break
 
+    # ----------------------------------------------------------------------
+    # File I/O
+    # ----------------------------------------------------------------------
     _READERS: Dict[str, type] = {
         ".stl": vtkSTLReader,
         ".ply": vtkPLYReader,
@@ -1184,18 +1450,6 @@ class ModelViewerWidget(QWidget):
 
     @classmethod
     def _reader_for(cls, path: str):
-        """Return an appropriate VTK reader for the given file extension.
-
-        Parameters
-        ----------
-        path : str
-            File path whose extension determines the reader type.
-
-        Returns
-        -------
-        vtkAbstractPolyDataReader
-            A configured VTK reader instance.
-        """
         ext = Path(path).suffix.lower()
         reader_cls = cls._READERS.get(ext, vtkXMLPolyDataReader)
         reader = reader_cls()
@@ -1203,7 +1457,6 @@ class ModelViewerWidget(QWidget):
         return reader
 
     def open_file(self) -> None:
-        """Present a file dialog and load the selected model."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Open 3-D Model", os.getcwd(),
             "3-D Models (*.stl *.obj *.ply *.vtp *.vtk);;All Files (*.*)",
@@ -1212,21 +1465,6 @@ class ModelViewerWidget(QWidget):
             self.load_model(path)
 
     def load_model(self, path: str, *, add_undo: bool = True) -> bool:
-        """Load a 3‑D model from a file.
-
-        Parameters
-        ----------
-        path : str
-            Absolute path to the model file.
-        add_undo : bool, optional
-            If True, push the current state onto the undo stack before loading.
-            Default is ``True``.
-
-        Returns
-        -------
-        bool
-            True if the model was loaded successfully, False otherwise.
-        """
         path = os.path.abspath(path)
         if not os.path.isfile(path):
             logger.error("load_model: file not found: %s", path)
@@ -1261,25 +1499,21 @@ class ModelViewerWidget(QWidget):
 
         actor = vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(
-            *_NAMED_COLORS.GetColor3d("LightSteelBlue"))
+        actor.GetProperty().SetColor(*_NAMED_COLORS.GetColor3d("LightSteelBlue"))
         actor.GetProperty().SetAmbient(0.2)
         actor.GetProperty().SetDiffuse(0.8)
         actor.GetProperty().SetSpecular(0.0)
 
         if self._actor is not None:
-            self._renderer.RemoveActor(self._actor)
+            self._viewport.remove_actor(self._actor)
 
         self._mapper = mapper
         self._plain_mapper = mapper
         self._actor = actor
         self._current_file = path
 
-        self._renderer.AddActor(actor)
-        self._renderer.ResetCamera()
-        self._renderer.ResetCameraClippingRange()
-
-        self._update_cube_axes()
+        self._viewport.add_actor(actor)
+        self._viewport.update_grid(self._source_poly)
 
         self._wire_btn.setChecked(False)
         self._grid_btn.setChecked(self._grid_visible)
@@ -1287,25 +1521,22 @@ class ModelViewerWidget(QWidget):
         self._layer_info_label.setText("Layer: - / -")
         self._layer_area_label.setText("Area: -")
 
-        self._vtk_widget._update_image()
-        self._set_status(f"Loaded: {os.path.basename(path)}")
+        self._viewport.reset_camera()
         self.model_loaded.emit(path)
         return True
 
     def _clear_actor(self) -> None:
-        """Remove the current actor without emitting signals or history changes."""
         if self._actor is not None:
-            self._renderer.RemoveActor(self._actor)
+            self._viewport.remove_actor(self._actor)
             self._actor = None
             self._mapper = None
             self._plain_mapper = None
             self._source_poly = None
             self._current_file = None
             self.show_grid(False)
-            self._vtk_widget._update_image()
+            self._viewport.render()
 
     def clear_model(self) -> None:
-        """Clear the scene and reset all analysis state."""
         self._cancel_wall_worker()
         self._clear_am_overlays()
         if self._actor is not None:
@@ -1314,49 +1545,33 @@ class ModelViewerWidget(QWidget):
             self.model_cleared.emit()
 
     def reset_camera(self) -> None:
-        """Reset the camera to show the whole model."""
-        self._renderer.ResetCamera()
-        self._renderer.ResetCameraClippingRange()
-        if self._cube_axes is not None:
-            self._cube_axes.SetCamera(self._renderer.GetActiveCamera())
-        self._vtk_widget._update_image()
+        self._viewport.reset_camera()
         self._set_status("Camera reset.")
 
     def _toggle_wireframe(self, checked: bool) -> None:
-        """Toggle between wireframe and solid representation.
-
-        Parameters
-        ----------
-        checked : bool
-            True for wireframe, False for solid.
-        """
         if self._actor is None:
             self._wire_btn.setChecked(False)
             return
         if checked:
             self._actor.GetProperty().SetRepresentationToWireframe()
-            self._wire_btn.setIcon(
-                QIcon(colorize_pixmap(QPixmap("line-icons:box-3-line.svg"),
-                                      self.palette().highlightedText().color())))
+            self._wire_btn.setIcon(QIcon(colorize_pixmap(
+                QPixmap("line-icons:box-3-line.svg"),
+                self.palette().highlightedText().color())))
         else:
             self._actor.GetProperty().SetRepresentationToSurface()
-            self._wire_btn.setIcon(
-                QIcon(colorize_pixmap(QPixmap("line-icons:global-line.svg"),
-                                      self.palette().highlightedText().color())))
-        self._vtk_widget._update_image()
+            self._wire_btn.setIcon(QIcon(colorize_pixmap(
+                QPixmap("line-icons:global-line.svg"),
+                self.palette().highlightedText().color())))
+        self._viewport.render()
 
     def _choose_background(self) -> None:
-        """Open a colour picker and set the renderer background."""
         color = QColorDialog.getColor(parent=self)
         if not color.isValid():
             return
-        self._renderer.SetBackground(
-            color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0,
-        )
-        self._vtk_widget._update_image()
+        self._viewport.set_background(
+            color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0)
 
     def _screenshot(self) -> None:
-        """Save a screenshot of the current view as a PNG file."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Screenshot", os.getcwd(), "PNG Image (*.png)"
         )
@@ -1364,7 +1579,6 @@ class ModelViewerWidget(QWidget):
             return
         if not path.lower().endswith(".png"):
             path += ".png"
-        # Use the render window directly – it’s already off‑screen
         w2if = vtkWindowToImageFilter()
         w2if.SetInput(self._vtk_widget.GetRenderWindow())
         w2if.Update()
@@ -1375,70 +1589,21 @@ class ModelViewerWidget(QWidget):
         self._set_status(f"Screenshot saved: {os.path.basename(path)}")
 
     def show_grid(self, visible: bool) -> None:
-        """Show or hide the bounding-box grid.
-
-        Parameters
-        ----------
-        visible : bool
-            If ``True``, the grid is shown (provided a model is loaded);
-            otherwise it is hidden.
-        """
         self._grid_visible = visible
-        if self._cube_axes is not None:
-            self._cube_axes.SetVisibility(visible)
-            self._grid_btn.setChecked(visible)
-            self._vtk_widget._update_image()
+        self._viewport.show_grid(visible)
+        self._grid_btn.setChecked(visible)
 
     def toggle_grid(self) -> None:
-        """Toggle the grid visibility on or off."""
         self.show_grid(not self._grid_visible)
 
-    def _update_cube_axes(self) -> None:
-        """Create or update the cube‑axes actor to match the current model bounds."""
-        if self._source_poly is None:
-            return
-        bounds = self._source_poly.GetBounds()
-        camera = self._renderer.GetActiveCamera()
-
-        if self._cube_axes is None:
-            self._cube_axes = vtkCubeAxesActor()
-            self._cube_axes.SetFlyModeToOuterEdges()
-            self._cube_axes.SetCamera(camera)
-            self._cube_axes.SetXAxisLabelVisibility(True)
-            self._cube_axes.SetYAxisLabelVisibility(True)
-            self._cube_axes.SetZAxisLabelVisibility(True)
-            self._cube_axes.SetXAxisTickVisibility(True)
-            self._cube_axes.SetYAxisTickVisibility(True)
-            self._cube_axes.SetZAxisTickVisibility(True)
-            self._cube_axes.SetLabelScaling(False, False, False, False)
-            self._cube_axes.GetXAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
-            self._cube_axes.GetYAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
-            self._cube_axes.GetZAxesGridlinesProperty().SetColor(0.6, 0.6, 0.6)
-            self._renderer.AddActor(self._cube_axes)
-        else:
-            self._cube_axes.SetCamera(camera)
-
-        self._cube_axes.SetBounds(bounds)
-        self._cube_axes.SetVisibility(self._grid_visible)
-
-    def _show_lighting_dialog(self) -> None:
-        """Open the lighting controls dialog."""
-        if self._actor is None:
-            self._set_status("No model loaded.")
-            return
-        LightingDialog(self._actor, self._vtk_widget.GetRenderWindow(),
-                       self).exec()
-
-    def _show_statistics_dialog(self) -> None:
-        """Open the model statistics dialog."""
-        StatisticsDialog(self._actor, self).exec()
-
+    # ----------------------------------------------------------------------
+    # Export (unchanged logic, but uses _viewport)
+    # ----------------------------------------------------------------------
     _FILTER_EXT: Dict[str, str] = {
         "*.stl": ".stl", "*.obj": ".obj", "*.ply": ".ply", "*.vtk": ".vtk",
     }
 
     def _show_export_dialog(self) -> None:
-        """Show the export file dialog and call _export_model."""
         if self._actor is None:
             self._set_status("No model loaded.")
             return
@@ -1456,13 +1621,6 @@ class ModelViewerWidget(QWidget):
         self._export_model(path)
 
     def _export_model(self, path: str) -> None:
-        """Write the current model to path in the format inferred from its extension.
-
-        Parameters
-        ----------
-        path : str
-            Output file path.
-        """
         if self._source_poly is None:
             self._set_status("Nothing to export.")
             return
@@ -1494,37 +1652,19 @@ class ModelViewerWidget(QWidget):
             logger.exception("Export failed for %s", path)
             self._set_status("Export failed -- see log.")
 
+    # ----------------------------------------------------------------------
+    # Analysis mode management (unchanged, but uses viewport)
+    # ----------------------------------------------------------------------
     def _set_build_dir(self, vec: Tuple[float, float, float]) -> None:
-        """Set the active build direction and refresh the current analysis.
-
-        Parameters
-        ----------
-        vec : tuple of float
-            New build direction vector (e.g. (0, 0, 1) for +Z).
-        """
         self._build_dir = vec
         self._refresh_analysis_if(self._am_mode)
         self._set_status(f"Build direction: {vec}")
 
     def _refresh_analysis_if(self, mode: AnalysisMode) -> None:
-        """Re-run the analysis only if mode matches the active one.
-
-        Parameters
-        ----------
-        mode : AnalysisMode
-            Analysis mode to refresh.
-        """
         if self._am_mode == mode:
             self._set_analysis_mode(mode)
 
     def _set_analysis_mode(self, mode: AnalysisMode) -> None:
-        """Switch to a different analysis mode, clearing previous overlays.
-
-        Parameters
-        ----------
-        mode : AnalysisMode
-            The new analysis mode.
-        """
         if self._actor is None and mode != AnalysisMode.NONE:
             self._set_status("Load a model first.")
             self._mode_radio[AnalysisMode.NONE].setChecked(True)
@@ -1547,20 +1687,20 @@ class ModelViewerWidget(QWidget):
         }
         dispatch[mode]()
 
+        self._viewport.render()
+
     def _clear_am_overlays(self) -> None:
-        """Remove all AM overlay actors and the scalar bar from the renderer."""
         for actor in self._am_overlays:
-            self._renderer.RemoveActor(actor)
+            self._viewport.remove_actor(actor)
         self._am_overlays.clear()
 
         if self._mesh_check_actor is not None:
-            self._renderer.RemoveActor(self._mesh_check_actor)
+            self._viewport.remove_actor(self._mesh_check_actor)
             self._mesh_check_actor = None
 
         self._hide_scalar_bar()
 
     def _restore_plain_actor(self) -> None:
-        """Reset the main actor to its neutral, non-analysis appearance."""
         if self._actor is None:
             return
         if self._plain_mapper is not None:
@@ -1578,16 +1718,22 @@ class ModelViewerWidget(QWidget):
         else:
             prop.SetRepresentationToSurface()
 
-    def _show_scalar_bar(self, title: str, lut: vtkLookupTable) -> None:
-        """Display a scalar bar on the right side of the viewport.
+    def _show_lighting_dialog(self) -> None:
+        if self._actor is None:
+            self._set_status("No model loaded.")
+            return
+        # Pass a callback that triggers the viewport’s render
+        LightingDialog(
+            self._actor,
+            render_callback=self._viewport.render,
+            parent=self,
+        ).exec()
 
-        Parameters
-        ----------
-        title : str
-            Title for the scalar bar.
-        lut : vtkLookupTable
-            Lookup table to use for colors.
-        """
+    def _show_statistics_dialog(self) -> None:
+        """Open the model statistics dialog."""
+        StatisticsDialog(self._actor, parent=self).exec()
+
+    def _show_scalar_bar(self, title: str, lut: vtkLookupTable) -> None:
         self._hide_scalar_bar()
         bar = vtkScalarBarActor()
         bar.SetLookupTable(lut)
@@ -1600,16 +1746,17 @@ class ModelViewerWidget(QWidget):
         bar.GetTitleTextProperty().SetFontSize(10)
         bar.GetLabelTextProperty().SetFontSize(9)
         self._scalar_bar = bar
-        self._renderer.AddActor2D(bar)
+        self._viewport.add_actor2d(bar)
 
     def _hide_scalar_bar(self) -> None:
-        """Remove the scalar bar if one is currently shown."""
         if self._scalar_bar is not None:
-            self._renderer.RemoveActor2D(self._scalar_bar)
+            self._viewport.remove_actor2d(self._scalar_bar)
             self._scalar_bar = None
 
+    # ----------------------------------------------------------------------
+    # Mesh check (unchanged except using viewport for rendering)
+    # ----------------------------------------------------------------------
     def _run_mesh_check(self) -> None:
-        """Identify boundary and non-manifold edges, highlighting them in red."""
         if self._source_poly is None:
             self._mesh_result_edit.setPlainText("No model loaded.")
             return
@@ -1653,12 +1800,11 @@ class ModelViewerWidget(QWidget):
         if n_nm > 0:
             issues = True
 
-        lines += ["",
-                  "Overall: PASS" if not issues else "Overall: ISSUES FOUND"]
+        lines += ["", "Overall: PASS" if not issues else "Overall: ISSUES FOUND"]
         self._mesh_result_edit.setPlainText("\n".join(lines))
 
         if self._mesh_check_actor is not None:
-            self._renderer.RemoveActor(self._mesh_check_actor)
+            self._viewport.remove_actor(self._mesh_check_actor)
             self._mesh_check_actor = None
 
         if issues:
@@ -1679,8 +1825,8 @@ class ModelViewerWidget(QWidget):
             bad_actor.GetProperty().SetRepresentationToWireframe()
 
             self._mesh_check_actor = bad_actor
-            self._renderer.AddActor(bad_actor)
-            self._vtk_widget._update_image()
+            self._viewport.add_actor(bad_actor)
+            self._viewport.render()
 
         n_issues = int(n_boundary > 0) + int(n_nm > 0)
         self._set_status(
@@ -1688,8 +1834,10 @@ class ModelViewerWidget(QWidget):
             else f"Mesh check: {n_issues} issue(s) found"
         )
 
+    # ----------------------------------------------------------------------
+    # Overhang analysis (unchanged, but uses viewport)
+    # ----------------------------------------------------------------------
     def _run_overhang_analysis(self) -> None:
-        """Colour each face by its overhang angle using a green‑orange‑red LUT."""
         if self._source_poly is None:
             return
 
@@ -1719,7 +1867,7 @@ class ModelViewerWidget(QWidget):
         self._mapper = am_mapper
 
         self._show_scalar_bar("Overhang (deg)", lut)
-        self._vtk_widget._update_image()
+        self._viewport.render()
 
         n_critical = int(np.sum(angles > threshold))
         pct = 100 * n_critical / max(len(angles), 1)
@@ -1728,8 +1876,10 @@ class ModelViewerWidget(QWidget):
             f"threshold {self._overhang_spin.value():.0f} deg from horizontal"
         )
 
+    # ----------------------------------------------------------------------
+    # Wall thickness (unchanged, but uses viewport)
+    # ----------------------------------------------------------------------
     def _start_wall_thickness(self) -> None:
-        """Launch the background wall-thickness computation."""
         if self._source_poly is None:
             return
         self._cancel_wall_worker()
@@ -1745,7 +1895,6 @@ class ModelViewerWidget(QWidget):
         worker.start()
 
     def _cancel_wall_worker(self) -> None:
-        """Gracefully cancel and wait for the wall thickness worker."""
         if self._wall_worker is not None and self._wall_worker.isRunning():
             self._wall_worker.cancel()
             self._wall_worker.wait()
@@ -1753,13 +1902,6 @@ class ModelViewerWidget(QWidget):
         self._wall_progress_label.setText("")
 
     def _on_wall_thickness_result(self, thicknesses: np.ndarray) -> None:
-        """Slot for wall thickness results; updates the actor's colouring.
-
-        Parameters
-        ----------
-        thicknesses : ndarray of float32
-            Per-point wall thickness values.
-        """
         self._wall_progress_label.setText("")
         if self._am_mode != AnalysisMode.WALL or self._actor is None:
             return
@@ -1788,7 +1930,7 @@ class ModelViewerWidget(QWidget):
         self._actor.SetMapper(am_mapper)
         self._mapper = am_mapper
         self._show_scalar_bar("Thickness (mm)", lut)
-        self._vtk_widget._update_image()
+        self._viewport.render()
 
         min_wall = self._min_wall_spin.value()
         n_thin = int(np.sum(thicknesses < min_wall))
@@ -1800,18 +1942,13 @@ class ModelViewerWidget(QWidget):
         )
 
     def _on_wall_thickness_error(self, msg: str) -> None:
-        """Slot for wall thickness computation errors.
-
-        Parameters
-        ----------
-        msg : str
-            Error message.
-        """
         self._wall_progress_label.setText("")
         self._set_status(f"Wall thickness error: {msg}")
 
+    # ----------------------------------------------------------------------
+    # Layer preview (unchanged)
+    # ----------------------------------------------------------------------
     def _setup_layer_preview(self) -> None:
-        """Enter layer preview mode: rebuild the slider and show layer 0."""
         if self._source_poly is None:
             return
         self._actor.GetProperty().SetOpacity(0.22)
@@ -1819,7 +1956,6 @@ class ModelViewerWidget(QWidget):
         self._update_layer_preview(self._layer_slider.value())
 
     def _rebuild_layer_slider(self) -> None:
-        """Recalculate the number of layers based on model height and thickness."""
         if self._source_poly is None:
             return
         _, height = _model_base_and_height(
@@ -1832,18 +1968,11 @@ class ModelViewerWidget(QWidget):
         self._layer_slider.setValue(min(prev, n_layers - 1))
 
     def _update_layer_preview(self, layer_idx: int) -> None:
-        """Show the cross-section of one layer and its area.
-
-        Parameters
-        ----------
-        layer_idx : int
-            Zero-based layer index to display.
-        """
         if self._am_mode != AnalysisMode.LAYER or self._source_poly is None:
             return
 
         for actor in self._am_overlays:
-            self._renderer.RemoveActor(actor)
+            self._viewport.remove_actor(actor)
         self._am_overlays.clear()
 
         thickness = self._layer_thickness_spin.value() / 1000.0
@@ -1883,7 +2012,7 @@ class ModelViewerWidget(QWidget):
         section_actor.GetProperty().SetDiffuse(0.6)
 
         self._am_overlays.append(section_actor)
-        self._renderer.AddActor(section_actor)
+        self._viewport.add_actor(section_actor)
 
         area = 0.0
         try:
@@ -1893,22 +2022,22 @@ class ModelViewerWidget(QWidget):
                     p0 = np.array(filled_pd.GetPoint(cell.GetPointId(0)))
                     p1 = np.array(filled_pd.GetPoint(cell.GetPointId(1)))
                     p2 = np.array(filled_pd.GetPoint(cell.GetPointId(2)))
-                    area += 0.5 * float(
-                        np.linalg.norm(np.cross(p1 - p0, p2 - p0)))
+                    area += 0.5 * float(np.linalg.norm(np.cross(p1 - p0, p2 - p0)))
         except Exception:
-            logger.warning(
-                "Layer preview: could not compute cross-section area")
+            logger.warning("Layer preview: could not compute cross-section area")
 
         self._layer_info_label.setText(f"Layer: {layer_idx + 1} / {n_layers}")
         self._layer_area_label.setText(f"Area: {area:.2f} mm\u00B2")
-        self._vtk_widget._update_image()
+        self._viewport.render()
         self._set_status(
             f"Layer {layer_idx + 1}/{n_layers}  "
             f"h={layer_h:.3f} mm  area={area:.2f} mm\u00B2"
         )
 
+    # ----------------------------------------------------------------------
+    # Support estimate (unchanged)
+    # ----------------------------------------------------------------------
     def _run_support_estimate(self) -> None:
-        """Highlight overhanging faces and estimate support volume."""
         if self._source_poly is None:
             return
 
@@ -1942,7 +2071,7 @@ class ModelViewerWidget(QWidget):
         oh_actor.GetProperty().SetDiffuse(0.7)
 
         self._am_overlays.append(oh_actor)
-        self._renderer.AddActor(oh_actor)
+        self._viewport.add_actor(oh_actor)
 
         base_h, _ = _model_base_and_height(
             self._source_poly.GetBounds(), self._build_dir
@@ -1968,15 +2097,17 @@ class ModelViewerWidget(QWidget):
             total_area += cell_area
             total_vol += cell_area * h
 
-        self._vtk_widget._update_image()
+        self._viewport.render()
         self._set_status(
             f"Support: {int(np.sum(overhang_mask))} overhanging cells  |  "
             f"projected area {total_area:.1f} mm\u00B2  |  "
             f"estimated support vol ~{total_vol:.1f} mm\u00B3"
         )
 
+    # ----------------------------------------------------------------------
+    # Cleanup (unchanged but delegates to viewport)
+    # ----------------------------------------------------------------------
     def cleanup(self) -> None:
-        """Release all VTK and Qt resources, making the widget safe to discard."""
         if getattr(self, "_cleaned_up", False):
             return
         self._cleaned_up = True
@@ -1988,31 +2119,12 @@ class ModelViewerWidget(QWidget):
             logger.exception("cleanup: error cancelling wall worker")
 
         try:
-            if self._ori_marker:
-                self._ori_marker.SetEnabled(0)
-                self._ori_marker.SetInteractor(None)
-        except Exception:
-            logger.exception("cleanup: error disabling orientation marker")
-
-        try:
             self._clear_am_overlays()
         except Exception:
             logger.exception("cleanup: error clearing AM overlays")
 
-        if self._cube_axes is not None:
-            try:
-                self._renderer.RemoveActor(self._cube_axes)
-            except Exception:
-                logger.exception("cleanup: error removing cube axes")
-            self._cube_axes = None
-
-        try:
-            if self._actor is not None:
-                self._renderer.RemoveActor(self._actor)
-            self._renderer.RemoveAllLights()
-            self._renderer.Clear()
-        except Exception:
-            logger.exception("cleanup: error clearing renderer")
+        if self._viewport:
+            self._viewport.cleanup()
 
         self._actor = None
         self._mapper = None
@@ -2020,19 +2132,13 @@ class ModelViewerWidget(QWidget):
         self._source_poly = None
         self._current_file = None
 
-        try:
-            self._vtk_widget.Finalize()
-        except Exception:
-            logger.exception("cleanup: error finalising VTK widget")
-
+        self._viewport = None
         self._renderer = None
         self._ori_marker = None
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._undo_manager.clear()
 
         logger.debug("ModelViewerWidget.cleanup() complete")
 
     def closeEvent(self, event) -> None:
-        """Handle a close event by finalising resources."""
         self.cleanup()
         event.accept()
