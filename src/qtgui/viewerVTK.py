@@ -59,7 +59,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import vtkmodules.all as vtk
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QSurfaceFormat, QIcon, QPixmap
+from PyQt6.QtGui import QSurfaceFormat, QIcon, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
@@ -112,9 +112,7 @@ from vtkmodules.vtkRenderingCore import (
     vtkWindowToImageFilter,
 )
 
-from qtcore.vtk_utils import SafeVTKWidget
 from qtgui.pixmap import colorize_pixmap
-from qtgui.style.toolbar import StyledToolBar
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +146,195 @@ def configure_surface_format():
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
+# ---------- off‑screen VTK widget (no X11 windows) ----------
+class OffscreenVTKWidget(QWidget):
+    """QWidget that renders VTK completely off‑screen and shows the result via QLabel.
+
+    Exposes the same minimal interface that ModelViewerWidget expects:
+    - GetRenderWindow() -> vtkRenderWindow
+    - _Iren                -> vtkRenderWindowInteractor
+    - Finalize()           -> clean VTK resources
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(400, 300)
+
+        # ----- VTK off‑screen pipeline -----
+        self._render_window = vtk.vtkRenderWindow()
+        self._render_window.OffScreenRenderingOn()   # NO X11 window ever created
+        # Initial size – will be corrected in resizeEvent / showEvent
+        self._render_window.SetSize(self.width(), self.height())
+
+        self._interactor = vtk.vtkRenderWindowInteractor()
+        self._interactor.SetRenderWindow(self._render_window)
+        self._interactor.Initialize()
+
+        self._w2i = vtk.vtkWindowToImageFilter()
+        self._w2i.SetInput(self._render_window)
+        self._w2i.SetScale(1)
+
+        # ----- Display label -----
+        self._image_label = QLabel(self)
+        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # ----- Mouse tracking -----
+        self.setMouseTracking(True)
+        self._last_pos = None
+
+        # Ensure the render window size is correct before the first render
+        self._sync_render_window_size()
+
+    # ---------- Public API expected by ModelViewerWidget ----------
+    @property
+    def _Iren(self):
+        """Compatibility name for the VTK interactor."""
+        return self._interactor
+
+    def GetRenderWindow(self):
+        """Return the VTK render window (already off‑screen)."""
+        return self._render_window
+
+    def Finalize(self):
+        """Clean up VTK objects when the widget is destroyed."""
+        try:
+            self._interactor.TerminateApp()
+        except Exception:
+            pass
+        try:
+            self._render_window.Finalize()
+        except Exception:
+            pass
+
+    # ----- Qt overrides -----
+    def resizeEvent(self, event):
+        """Keep the render buffer and label in sync with the widget."""
+        self._sync_render_window_size()
+        self._image_label.resize(self.size())
+        self._update_image()
+        super().resizeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Ensure the first frame is rendered once the widget is visible.
+        self._sync_render_window_size()
+        self._update_image()
+
+    def paintEvent(self, event):
+        # The label handles painting; we just trigger a refresh if needed.
+        pass
+
+    def _sync_render_window_size(self):
+        """Make the off‑screen buffer exactly match the widget’s pixel size."""
+        w = self.width()
+        h = self.height()
+        if w > 0 and h > 0:
+            self._render_window.SetSize(w, h)
+
+    # ----- Image generation -----
+    def _update_image(self):
+        """Render the VTK scene and transfer it to the QLabel (no scaling)."""
+        # Only render if a renderer exists (added later by parent)
+        if not self._render_window.GetRenderers().GetNumberOfItems():
+            return
+
+        # Make sure the render window size is current
+        self._sync_render_window_size()
+
+        self._render_window.Render()
+        self._w2i.Modified()
+        self._w2i.Update()
+        image_data = self._w2i.GetOutput()
+
+        width, height, _ = image_data.GetDimensions()
+        ncomp = image_data.GetNumberOfScalarComponents()
+        if ncomp in (3, 4):
+            arr = vtk_to_numpy(image_data.GetPointData().GetScalars())
+            arr = arr.reshape(height, width, ncomp)
+            if ncomp == 4:
+                arr = arr[:, :, :3]  # drop alpha
+
+            # VTK puts origin at bottom-left; Qt expects top-left → flip vertically
+            arr = np.flipud(arr)
+            # Make the array contiguous, as QImage requires a contiguous byte buffer
+            arr = np.ascontiguousarray(arr)
+
+            h, w, _ = arr.shape
+            bytes_per_line = 3 * w
+            # Pass the data as bytes to match QImage(data: bytes, width, height, bytesPerLine, format)
+            qim = QImage(bytes(arr.data), w, h, bytes_per_line,
+                         QImage.Format.Format_RGB888)
+
+            # Use the image directly – no scaling – for pixel‑perfect display
+            pixmap = QPixmap.fromImage(qim)
+            self._image_label.setPixmap(pixmap)
+            self._image_label.setFixedSize(pixmap.size())
+
+    # ----- Mouse / keyboard → VTK interactor -----
+    def _event_position_xy(self, event):
+        pos = event.position()
+        return int(pos.x()), int(pos.y())
+
+    def mousePressEvent(self, event):
+        x, y = self._event_position_xy(event)
+        self._last_pos = event.pos()
+        self._interactor.SetEventInformationFlipY(x, y, 0, 0, chr(0), 0, None)
+        btn = event.button()
+        if btn == Qt.MouseButton.LeftButton:
+            self._interactor.LeftButtonPressEvent()
+        elif btn == Qt.MouseButton.RightButton:
+            self._interactor.RightButtonPressEvent()
+        elif btn == Qt.MouseButton.MiddleButton:
+            self._interactor.MiddleButtonPressEvent()
+        self._update_image()
+
+    def mouseReleaseEvent(self, event):
+        x, y = self._event_position_xy(event)
+        self._last_pos = event.pos()
+        self._interactor.SetEventInformationFlipY(x, y, 0, 0, chr(0), 0, None)
+        btn = event.button()
+        if btn == Qt.MouseButton.LeftButton:
+            self._interactor.LeftButtonReleaseEvent()
+        elif btn == Qt.MouseButton.RightButton:
+            self._interactor.RightButtonReleaseEvent()
+        elif btn == Qt.MouseButton.MiddleButton:
+            self._interactor.MiddleButtonReleaseEvent()
+        self._update_image()
+
+    def mouseMoveEvent(self, event):
+        if self._last_pos is None:
+            return
+        x, y = self._event_position_xy(event)
+        self._interactor.SetEventInformationFlipY(x, y, 0, 0, chr(0), 0, None)
+        self._interactor.MouseMoveEvent()
+        self._update_image()
+
+    def wheelEvent(self, event):
+        pos = event.position()
+        x, y = int(pos.x()), int(pos.y())
+        self._interactor.SetEventInformationFlipY(x, y, 0, 0, chr(0), 0, None)
+        if event.angleDelta().y() > 0:
+            self._interactor.MouseWheelForwardEvent()
+        else:
+            self._interactor.MouseWheelBackwardEvent()
+        self._update_image()
+
+    def keyPressEvent(self, event):
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        x, y = int(pos.x()), int(pos.y())
+        self._interactor.SetEventInformation(x, y, 0, 0, event.text(), 0, None)
+        self._interactor.KeyPressEvent()
+        self._update_image()
+
+    def keyReleaseEvent(self, event):
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        x, y = int(pos.x()), int(pos.y())
+        self._interactor.SetEventInformation(x, y, 0, 0, event.text(), 0, None)
+        self._interactor.KeyReleaseEvent()
+        self._update_image()
+
+
+# ---------- helper functions for AM analyses ----------
 def _capture_actor_props(actor: vtkActor) -> dict:
     """Return a serialisable snapshot of the actor's visual properties.
 
@@ -639,6 +826,10 @@ class ModelViewerWidget(QWidget):
         self._grid_visible: bool = False
         self._cube_axes: Optional[vtkCubeAxesActor] = None
 
+        # Renderer and interactor will be set up in _init_vtk
+        self._renderer: Optional[vtkRenderer] = None
+        self._ori_marker: Optional[vtkOrientationMarkerWidget] = None
+
         self._setup_ui()
         QTimer.singleShot(500, self._init_vtk)
 
@@ -676,20 +867,18 @@ class ModelViewerWidget(QWidget):
 
         self._wire_btn = QToolButton()
         self._wire_btn.setCheckable(True)
-        self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
-            "line-icons:global-line.svg"), self.palette().highlightedText(
-
-        ).color())))
+        self._wire_btn.setIcon(
+            QIcon(colorize_pixmap(QPixmap("line-icons:global-line.svg"),
+                                  self.palette().highlightedText().color())))
         self._wire_btn.setToolTip("Toggle wireframe/solid")
         self._wire_btn.toggled.connect(self._toggle_wireframe)
         toolbar.addWidget(self._wire_btn)
 
         self._grid_btn = QToolButton()
         self._grid_btn.setCheckable(True)
-        self._grid_btn.setIcon(QIcon(QIcon(colorize_pixmap(QPixmap(
-            "line-icons:grid-line.svg"), self.palette().highlightedText(
-
-        ).color()))))
+        self._grid_btn.setIcon(
+            QIcon(colorize_pixmap(QPixmap("line-icons:grid-line.svg"),
+                                  self.palette().highlightedText().color())))
         self._grid_btn.setToolTip("Toggle bounding-box grid")
         self._grid_btn.toggled.connect(self.toggle_grid)
         toolbar.addWidget(self._grid_btn)
@@ -716,7 +905,8 @@ class ModelViewerWidget(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
-        self._vtk_widget = SafeVTKWidget(self)
+        # Use the off‑screen widget instead of SafeVTKWidget
+        self._vtk_widget = OffscreenVTKWidget(self)
         splitter.addWidget(self._vtk_widget)
 
         am_panel = self._build_am_panel()
@@ -725,22 +915,7 @@ class ModelViewerWidget(QWidget):
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([1000, 240])
 
-        self._renderer = vtkRenderer()
-        self._vtk_widget.GetRenderWindow().AddRenderer(self._renderer)
-
-        style = vtkInteractorStyleTrackballCamera()
-        self._vtk_widget._Iren.SetInteractorStyle(style)
-
-        colors = vtkNamedColors()
-        self._renderer.SetBackground(colors.GetColor3d("SlateGray"))
-
-        axes = vtkAxesActor()
-        self._ori_marker = vtkOrientationMarkerWidget()
-        self._ori_marker.SetInteractor(self._vtk_widget._Iren)
-        self._ori_marker.SetOrientationMarker(axes)
-        self._ori_marker.SetEnabled(1)
-        self._ori_marker.InteractiveOn()
-
+        # VTK renderer, style, and orientation marker will be set in _init_vtk
         self.setAcceptDrops(True)
 
     def _build_am_panel(self) -> QWidget:
@@ -861,9 +1036,28 @@ class ModelViewerWidget(QWidget):
     def _init_vtk(self) -> None:
         """Finalise VTK initialisation after the widget is shown."""
         try:
-            iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-            iren.Initialize()
-            self._vtk_widget.GetRenderWindow().Render()
+            # Create renderer and attach it to the already‑existing render window
+            self._renderer = vtkRenderer()
+            self._vtk_widget.GetRenderWindow().AddRenderer(self._renderer)
+
+            # Set background colour (SlateGray)
+            colors = vtkNamedColors()
+            self._renderer.SetBackground(colors.GetColor3d("SlateGray"))
+
+            # Set the interactor style
+            style = vtkInteractorStyleTrackballCamera()
+            self._vtk_widget._Iren.SetInteractorStyle(style)
+
+            # Orientation marker
+            axes = vtkAxesActor()
+            self._ori_marker = vtkOrientationMarkerWidget()
+            self._ori_marker.SetInteractor(self._vtk_widget._Iren)
+            self._ori_marker.SetOrientationMarker(axes)
+            self._ori_marker.SetEnabled(1)
+            self._ori_marker.InteractiveOn()
+
+            # Trigger the very first render and display
+            self._vtk_widget._update_image()
         except Exception:
             logger.exception("VTK initialisation failed")
             self._set_status("VTK initialisation failed -- see log")
@@ -896,7 +1090,7 @@ class ModelViewerWidget(QWidget):
         snap: dict = {
             "action": action,
             "file": self._current_file,
-            "background": tuple(self._renderer.GetBackground()),
+            "background": tuple(self._renderer.GetBackground()) if self._renderer else (),
             "wireframe": self._wire_btn.isChecked(),
             "grid": self._grid_visible,
             "am_mode": self._am_mode.value,
@@ -919,7 +1113,8 @@ class ModelViewerWidget(QWidget):
         else:
             self._clear_actor()
 
-        self._renderer.SetBackground(*snap["background"])
+        if self._renderer and "background" in snap:
+            self._renderer.SetBackground(*snap["background"])
 
         if self._actor is not None and "actor_props" in snap:
             _apply_actor_props(self._actor, snap["actor_props"])
@@ -933,7 +1128,7 @@ class ModelViewerWidget(QWidget):
         self._build_dir = snap.get("build_dir", (0.0, 0.0, 1.0))
         am_mode_str = snap.get("am_mode", AnalysisMode.NONE.value)
         self._set_analysis_mode(AnalysisMode(am_mode_str))
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
 
     def _push_undo(self, action: str) -> None:
         """Push a snapshot onto the undo stack and clear the redo stack.
@@ -1092,7 +1287,7 @@ class ModelViewerWidget(QWidget):
         self._layer_info_label.setText("Layer: - / -")
         self._layer_area_label.setText("Area: -")
 
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
         self._set_status(f"Loaded: {os.path.basename(path)}")
         self.model_loaded.emit(path)
         return True
@@ -1107,7 +1302,7 @@ class ModelViewerWidget(QWidget):
             self._source_poly = None
             self._current_file = None
             self.show_grid(False)
-            self._vtk_widget.GetRenderWindow().Render()
+            self._vtk_widget._update_image()
 
     def clear_model(self) -> None:
         """Clear the scene and reset all analysis state."""
@@ -1124,7 +1319,7 @@ class ModelViewerWidget(QWidget):
         self._renderer.ResetCameraClippingRange()
         if self._cube_axes is not None:
             self._cube_axes.SetCamera(self._renderer.GetActiveCamera())
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
         self._set_status("Camera reset.")
 
     def _toggle_wireframe(self, checked: bool) -> None:
@@ -1140,20 +1335,15 @@ class ModelViewerWidget(QWidget):
             return
         if checked:
             self._actor.GetProperty().SetRepresentationToWireframe()
-            self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
-                "line-icons:box-3-line.svg"),
-                                                         self.palette(
-
-                                                         ).highlightedText(
-
-                                                         ).color())))
+            self._wire_btn.setIcon(
+                QIcon(colorize_pixmap(QPixmap("line-icons:box-3-line.svg"),
+                                      self.palette().highlightedText().color())))
         else:
             self._actor.GetProperty().SetRepresentationToSurface()
-            self._wire_btn.setIcon(QIcon(colorize_pixmap(QPixmap(
-                "line-icons:global-line.svg"), self.palette().highlightedText(
-
-            ).color())))
-        self._vtk_widget.GetRenderWindow().Render()
+            self._wire_btn.setIcon(
+                QIcon(colorize_pixmap(QPixmap("line-icons:global-line.svg"),
+                                      self.palette().highlightedText().color())))
+        self._vtk_widget._update_image()
 
     def _choose_background(self) -> None:
         """Open a colour picker and set the renderer background."""
@@ -1163,7 +1353,7 @@ class ModelViewerWidget(QWidget):
         self._renderer.SetBackground(
             color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0,
         )
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
 
     def _screenshot(self) -> None:
         """Save a screenshot of the current view as a PNG file."""
@@ -1174,6 +1364,7 @@ class ModelViewerWidget(QWidget):
             return
         if not path.lower().endswith(".png"):
             path += ".png"
+        # Use the render window directly – it’s already off‑screen
         w2if = vtkWindowToImageFilter()
         w2if.SetInput(self._vtk_widget.GetRenderWindow())
         w2if.Update()
@@ -1196,7 +1387,7 @@ class ModelViewerWidget(QWidget):
         if self._cube_axes is not None:
             self._cube_axes.SetVisibility(visible)
             self._grid_btn.setChecked(visible)
-            self._vtk_widget.GetRenderWindow().Render()
+            self._vtk_widget._update_image()
 
     def toggle_grid(self) -> None:
         """Toggle the grid visibility on or off."""
@@ -1489,7 +1680,7 @@ class ModelViewerWidget(QWidget):
 
             self._mesh_check_actor = bad_actor
             self._renderer.AddActor(bad_actor)
-            self._vtk_widget.GetRenderWindow().Render()
+            self._vtk_widget._update_image()
 
         n_issues = int(n_boundary > 0) + int(n_nm > 0)
         self._set_status(
@@ -1528,7 +1719,7 @@ class ModelViewerWidget(QWidget):
         self._mapper = am_mapper
 
         self._show_scalar_bar("Overhang (deg)", lut)
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
 
         n_critical = int(np.sum(angles > threshold))
         pct = 100 * n_critical / max(len(angles), 1)
@@ -1597,7 +1788,7 @@ class ModelViewerWidget(QWidget):
         self._actor.SetMapper(am_mapper)
         self._mapper = am_mapper
         self._show_scalar_bar("Thickness (mm)", lut)
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
 
         min_wall = self._min_wall_spin.value()
         n_thin = int(np.sum(thicknesses < min_wall))
@@ -1710,7 +1901,7 @@ class ModelViewerWidget(QWidget):
 
         self._layer_info_label.setText(f"Layer: {layer_idx + 1} / {n_layers}")
         self._layer_area_label.setText(f"Area: {area:.2f} mm\u00B2")
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
         self._set_status(
             f"Layer {layer_idx + 1}/{n_layers}  "
             f"h={layer_h:.3f} mm  area={area:.2f} mm\u00B2"
@@ -1777,7 +1968,7 @@ class ModelViewerWidget(QWidget):
             total_area += cell_area
             total_vol += cell_area * h
 
-        self._vtk_widget.GetRenderWindow().Render()
+        self._vtk_widget._update_image()
         self._set_status(
             f"Support: {int(np.sum(overhang_mask))} overhanging cells  |  "
             f"projected area {total_area:.1f} mm\u00B2  |  "
@@ -1797,8 +1988,9 @@ class ModelViewerWidget(QWidget):
             logger.exception("cleanup: error cancelling wall worker")
 
         try:
-            self._ori_marker.SetEnabled(0)
-            self._ori_marker.SetInteractor(None)
+            if self._ori_marker:
+                self._ori_marker.SetEnabled(0)
+                self._ori_marker.SetInteractor(None)
         except Exception:
             logger.exception("cleanup: error disabling orientation marker")
 
@@ -1827,13 +2019,6 @@ class ModelViewerWidget(QWidget):
         self._plain_mapper = None
         self._source_poly = None
         self._current_file = None
-
-        try:
-            rw = self._vtk_widget.GetRenderWindow()
-            rw.Finalize()
-            self._vtk_widget._Iren.TerminateApp()
-        except Exception:
-            logger.exception("cleanup: error finalising render window")
 
         try:
             self._vtk_widget.Finalize()
