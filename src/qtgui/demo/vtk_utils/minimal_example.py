@@ -1,53 +1,63 @@
+#!/usr/bin/env python3
+
 import sys
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-from PyQt6.QtCore import QTimer
+
+# noinspection PyUnresolvedReferences
+import vtkmodules.vtkInteractionStyle
+# noinspection PyUnresolvedReferences
+import vtkmodules.vtkRenderingOpenGL2
+from PyQt6.QtWidgets import QMainWindow, QFrame, QVBoxLayout, QApplication
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-import vtk
+from vtkmodules.vtkFiltersSources import vtkSphereSource
+from vtkmodules.vtkRenderingCore import (
+    vtkActor,
+    vtkPolyDataMapper,
+    vtkRenderer
+)
+
 
 class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("VTK + PyQt6 (deferred timer)")
-        self.setGeometry(100, 100, 800, 600)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def __init__(self, parent=None):
+        QMainWindow.__init__(self, parent)
 
-        # Placeholder: we will create the VTK widget later
-        self.vtk_widget = None
+        self.frame = QFrame()
 
-        # Schedule the setup once the event loop starts
-        QTimer.singleShot(0, self.setup_vtk)
+        self.vl = QVBoxLayout()
+        self.vtkWidget = QVTKRenderWindowInteractor(self.frame)
+        self.vl.addWidget(self.vtkWidget)
 
-    def setup_vtk(self):
-        # At this point the main window is shown and has a valid native handle
-        self.vtk_widget = QVTKRenderWindowInteractor(self.centralWidget())
-        self.centralWidget().layout().addWidget(self.vtk_widget)
+        self.ren = vtkRenderer()
+        self.vtkWidget.GetRenderWindow().AddRenderer(self.ren)
+        self.iren = self.vtkWidget.GetRenderWindow().GetInteractor()
 
-        render_window = self.vtk_widget.GetRenderWindow()
+        # Create source
+        source = vtkSphereSource()
+        source.SetCenter(0, 0, 0)
+        source.SetRadius(5.0)
 
-        render_window.SetOffScreenRendering(True)
+        # Create a mapper
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
 
-        renderer = vtk.vtkRenderer()
-        render_window.AddRenderer(renderer)
-
-        sphere = vtk.vtkSphereSource()
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(sphere.GetOutputPort())
-        actor = vtk.vtkActor()
+        # Create an actor
+        actor = vtkActor()
         actor.SetMapper(mapper)
 
-        renderer.AddActor(actor)
-        renderer.SetBackground(0.1, 0.2, 0.4)
+        self.ren.AddActor(actor)
 
-        interactor = render_window.GetInteractor()
-        interactor.Initialize()
-        render_window.Render()
+        self.ren.ResetCamera()
+
+        self.frame.setLayout(self.vl)
+        self.setCentralWidget(self.frame)
+
+        self.show()
+        self.iren.Initialize()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
     window = MainWindow()
-    window.show()
+
     sys.exit(app.exec())
