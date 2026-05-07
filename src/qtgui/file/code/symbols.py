@@ -517,7 +517,6 @@ QLineEdit#FilterEdit {
     border: 1px solid #3E4452;
     border-radius: 4px;
     padding: 4px 8px;
-    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
     font-size: 12px;
     selection-background-color: #3E4452;
 }
@@ -533,7 +532,6 @@ QTreeView#SymbolTree {
     alternate-background-color: #2C313A;
     color: #ABB2BF;
     border: none;
-    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
     font-size: 12px;
     show-decoration-selected: 1;
     outline: none;
@@ -563,7 +561,6 @@ QHeaderView::section {
     border: none;
     border-bottom: 1px solid #3E4452;
     padding: 3px 6px;
-    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -583,7 +580,6 @@ QPushButton#ToolBtn:checked{ color: #61AFEF; }
 
 QLabel#LangBadge {
     color: #5C6370;
-    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
     font-size: 10px;
     padding: 0 4px;
 }
@@ -701,7 +697,6 @@ class SymbolsWidget(QWidget):
         self._status.setStyleSheet(
             "background:#21252B; color:#5C6370; border-top:1px solid #3E4452;"
             "padding:2px 8px; font-size:10px;"
-            "font-family:'JetBrains Mono','Fira Code','Consolas',monospace;"
         )
         self._status.setFixedHeight(20)
         root_layout.addWidget(self._status)

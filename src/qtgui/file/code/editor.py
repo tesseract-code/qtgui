@@ -36,13 +36,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QPlainTextEdit, QTextEdit, QWidget,
-    QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox,
-    QTabWidget, QDialog, QLabel, QLineEdit, QPushButton,
-    QCheckBox, QToolBar, QMenu, QFontDialog, QComboBox, QSpinBox, QStatusBar,
-    QMenuBar, QSplitter,
-)
 from PyQt6.QtCore import (
     Qt, QRect, QSize, QRegularExpression, QFileSystemWatcher, QTimer,
 )
@@ -51,21 +44,29 @@ from PyQt6.QtGui import (
     QTextCursor, QKeySequence, QAction, QPalette,
     QFontMetricsF, QTextDocument,
 )
+from PyQt6.QtWidgets import (
+    QApplication, QPlainTextEdit, QTextEdit, QWidget,
+    QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox,
+    QTabWidget, QDialog, QLabel, QLineEdit, QPushButton,
+    QCheckBox, QToolBar, QMenu, QFontDialog, QComboBox, QSpinBox, QStatusBar,
+    QMenuBar, QSplitter,
+)
 
 # ── Optional symbols panel ────────────────────────────────────────────────────
 try:
     from qtgui.file.code.symbols import SymbolsWidget
+
     _SYMBOLS_AVAILABLE = True
 except ImportError:
     _SYMBOLS_AVAILABLE = False
 
 # Maps editor LangInfo.name → symbols_view language tag accepted by load_source
 _LANG_TO_SYMBOLS: dict[str, str] = {
-    "Python":     "python",
-    "SQL":        "sql",
-    "C / C++":    "cpp",
+    "Python": "python",
+    "SQL": "sql",
+    "C / C++": "cpp",
     "JavaScript": "javascript",
-    "Markdown":   "markdown",
+    "Markdown": "markdown",
 }
 
 
@@ -86,18 +87,18 @@ class BaseHighlighter(QSyntaxHighlighter):
     """
 
     # ── VS-Code-inspired token palette ────────────────────────────────────────
-    C_KEYWORD   = QColor("#569CD6")
-    C_TYPE      = QColor("#4EC9B0")
-    C_FUNCTION  = QColor("#DCDCAA")
-    C_STRING    = QColor("#CE9178")
-    C_NUMBER    = QColor("#B5CEA8")
-    C_COMMENT   = QColor("#6A9955")
-    C_PREPROC   = QColor("#C586C0")
-    C_SPECIAL   = QColor("#9CDCFE")
-    C_REGEX     = QColor("#D16969")
-    C_HEADING   = QColor("#F44747")
-    C_BOLD      = QColor("#CE9178")
-    C_LINK      = QColor("#4EC9B0")
+    C_KEYWORD = QColor("#569CD6")
+    C_TYPE = QColor("#4EC9B0")
+    C_FUNCTION = QColor("#DCDCAA")
+    C_STRING = QColor("#CE9178")
+    C_NUMBER = QColor("#B5CEA8")
+    C_COMMENT = QColor("#6A9955")
+    C_PREPROC = QColor("#C586C0")
+    C_SPECIAL = QColor("#9CDCFE")
+    C_REGEX = QColor("#D16969")
+    C_HEADING = QColor("#F44747")
+    C_BOLD = QColor("#CE9178")
+    C_LINK = QColor("#4EC9B0")
 
     def __init__(self, document: QTextDocument):
         super().__init__(document)
@@ -152,16 +153,16 @@ class BaseHighlighter(QSyntaxHighlighter):
             self._apply_multiline(text, open_rx, close_rx, state, fmt)
 
     def _apply_multiline(self, text: str,
-                         open_rx:  QRegularExpression,
+                         open_rx: QRegularExpression,
                          close_rx: QRegularExpression,
-                         state:    int,
-                         fmt:      QTextCharFormat):
+                         state: int,
+                         fmt: QTextCharFormat):
         if self.previousBlockState() == state:
             start, add = 0, 0
         else:
-            m     = open_rx.match(text)
+            m = open_rx.match(text)
             start = m.capturedStart() if m.hasMatch() else -1
-            add   = m.capturedLength() if m.hasMatch() else 0
+            add = m.capturedLength() if m.hasMatch() else 0
 
         while start >= 0:
             m = close_rx.match(text, start + add)
@@ -172,9 +173,9 @@ class BaseHighlighter(QSyntaxHighlighter):
                 self.setCurrentBlockState(state)
                 length = len(text) - start
             self.setFormat(start, length, fmt)
-            nxt   = open_rx.match(text, start + length)
+            nxt = open_rx.match(text, start + length)
             start = nxt.capturedStart() if nxt.hasMatch() else -1
-            add   = nxt.capturedLength() if nxt.hasMatch() else 0
+            add = nxt.capturedLength() if nxt.hasMatch() else 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,7 +210,7 @@ class PythonHighlighter(BaseHighlighter):
         self._add(r"@[\w.]+", self._fmt(self.C_PREPROC))
         self._add_keywords(self._KEYWORDS, self._fmt(self.C_KEYWORD, bold=True))
         self._add_keywords(self._BUILTINS, self._fmt(self.C_TYPE))
-        self._add(r"\bdef\s+(\w+)",   self._fmt(self.C_FUNCTION))
+        self._add(r"\bdef\s+(\w+)", self._fmt(self.C_FUNCTION))
         self._add(r"\bclass\s+(\w+)", self._fmt(self.C_TYPE, bold=True))
         self._add(r"\b(\w+)(?=\s*\()", self._fmt(self.C_FUNCTION))
         self._add(r"\b(self|cls)\b", self._fmt(self.C_SPECIAL, italic=True))
@@ -261,12 +262,12 @@ class SQLHighlighter(BaseHighlighter):
 
     def _build_rules(self):
         ci = QRegularExpression.PatternOption.CaseInsensitiveOption
-        self._add_keywords(self._KEYWORDS,  self._fmt(self.C_KEYWORD, bold=True))
+        self._add_keywords(self._KEYWORDS, self._fmt(self.C_KEYWORD, bold=True))
         self._add(r"\b(?:" + "|".join(self._TYPES) + r")\b",
                   self._fmt(self.C_TYPE), ci)
         self._add(r"\b(?:" + "|".join(self._FUNCTIONS) + r")\b",
                   self._fmt(self.C_FUNCTION), ci)
-        self._add(r"`[^`]*`",    self._fmt(self.C_SPECIAL))
+        self._add(r"`[^`]*`", self._fmt(self.C_SPECIAL))
         self._add(r"\[[^\]]*\]", self._fmt(self.C_SPECIAL))
         self._add(r"'[^'\\]*(?:\\.[^'\\]*)*'", self._fmt(self.C_STRING))
         self._add(r"\b\d+\.?\d*\b", self._fmt(self.C_NUMBER))
@@ -307,7 +308,7 @@ class CHighlighter(BaseHighlighter):
         self._add(r'(?<=#\s*include\s)(?:<[^>]*>|"[^"]*")',
                   self._fmt(self.C_STRING))
         self._add_keywords(self._KEYWORDS, self._fmt(self.C_KEYWORD, bold=True))
-        self._add_keywords(self._TYPES,    self._fmt(self.C_TYPE))
+        self._add_keywords(self._TYPES, self._fmt(self.C_TYPE))
         self._add(r"\bthis\b", self._fmt(self.C_SPECIAL, italic=True))
         self._add(r"\b(\w+)(?=\s*\()", self._fmt(self.C_FUNCTION))
         self._add(r'"[^"\\]*(?:\\.[^"\\]*)*"', self._fmt(self.C_STRING))
@@ -401,29 +402,29 @@ class LangInfo:
                  extensions: tuple[str, ...],
                  comment_prefix: str = "",
                  indent_colon: bool = False):
-        self.name            = name
+        self.name = name
         self.highlighter_cls = highlighter_cls
-        self.extensions      = extensions
-        self.comment_prefix  = comment_prefix
-        self.indent_colon    = indent_colon
+        self.extensions = extensions
+        self.comment_prefix = comment_prefix
+        self.indent_colon = indent_colon
 
 
 LANGUAGES: list[LangInfo] = [
-    LangInfo("Plain Text",  PlainHighlighter,      (),
+    LangInfo("Plain Text", PlainHighlighter, (),
              comment_prefix=""),
-    LangInfo("Python",      PythonHighlighter,
+    LangInfo("Python", PythonHighlighter,
              ("py", "pyw", "pyi", "pyx", "pxd"),
              comment_prefix="# ", indent_colon=True),
-    LangInfo("SQL",         SQLHighlighter,
+    LangInfo("SQL", SQLHighlighter,
              ("sql", "ddl", "dml"),
              comment_prefix="-- "),
-    LangInfo("C / C++",     CHighlighter,
+    LangInfo("C / C++", CHighlighter,
              ("c", "h", "cpp", "cxx", "cc", "hpp", "hxx", "hh", "inl"),
              comment_prefix="// "),
-    LangInfo("JavaScript",  JavaScriptHighlighter,
+    LangInfo("JavaScript", JavaScriptHighlighter,
              ("js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"),
              comment_prefix="// "),
-    LangInfo("Markdown",    MarkdownHighlighter,
+    LangInfo("Markdown", MarkdownHighlighter,
              ("md", "markdown", "mdx", "rst"),
              comment_prefix=""),
 ]
@@ -483,10 +484,10 @@ class CodeEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._line_area   = LineNumberArea(self)
+        self._line_area = LineNumberArea(self)
         self._highlighter: BaseHighlighter | None = None
-        self._tab_size    = 4
-        self._lang        = PLAIN_TEXT
+        self._tab_size = 4
+        self._lang = PLAIN_TEXT
         self.filepath: str | None = None
 
         self._setup_font()
@@ -527,7 +528,7 @@ class CodeEditor(QPlainTextEdit):
 
     def line_number_area_width(self) -> int:
         digits = len(str(max(1, self.blockCount())))
-        fm     = QFontMetricsF(self.font())
+        fm = QFontMetricsF(self.font())
         return int(fm.horizontalAdvance("9") * digits) + 20
 
     def _update_line_area_width(self, _):
@@ -551,20 +552,20 @@ class CodeEditor(QPlainTextEdit):
 
     def lineNumberAreaPaintEvent(self, event):
         pal = self.palette()
-        p   = QPainter(self._line_area)
-        bg  = pal.color(QPalette.ColorRole.Base).darker(115)
+        p = QPainter(self._line_area)
+        bg = pal.color(QPalette.ColorRole.Base).darker(115)
         p.fillRect(event.rect(), bg)
         p.setPen(pal.color(QPalette.ColorRole.Mid))
         p.drawLine(self._line_area.width() - 1, event.rect().top(),
                    self._line_area.width() - 1, event.rect().bottom())
 
-        block         = self.firstVisibleBlock()
-        num           = block.blockNumber()
-        top           = int(self.blockBoundingGeometry(block)
-                            .translated(self.contentOffset()).top())
-        bottom        = top + int(self.blockBoundingRect(block).height())
+        block = self.firstVisibleBlock()
+        num = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block)
+                  .translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
         current_block = self.textCursor().blockNumber()
-        fh            = int(QFontMetricsF(self.font()).height())
+        fh = int(QFontMetricsF(self.font()).height())
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
@@ -576,10 +577,10 @@ class CodeEditor(QPlainTextEdit):
                            self._line_area.width() - 8, fh,
                            Qt.AlignmentFlag.AlignRight,
                            str(num + 1))
-            block  = block.next()
-            top    = bottom
+            block = block.next()
+            top = bottom
             bottom = top + int(self.blockBoundingRect(block).height())
-            num   += 1
+            num += 1
         p.end()
 
     # ── Current-line highlight ─────────────────────────────────────────────────
@@ -602,19 +603,23 @@ class CodeEditor(QPlainTextEdit):
     # ── Key handling ───────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
-        key  = event.key()
+        key = event.key()
         mods = event.modifiers()
 
         if key == Qt.Key.Key_Tab and not mods:
-            self._on_tab(); return
+            self._on_tab()
+            return
         if key == Qt.Key.Key_Backtab:
-            self._dedent(); return
+            self._dedent()
+            return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._auto_indent(); return
+            self._auto_indent()
+            return
 
         _pairs = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
         if event.text() in _pairs and not mods:
-            self._auto_close(event.text(), _pairs[event.text()]); return
+            self._auto_close(event.text(), _pairs[event.text()]);
+            return
 
         super().keyPressEvent(event)
 
@@ -627,7 +632,7 @@ class CodeEditor(QPlainTextEdit):
 
     def _indent_lines(self, cur: QTextCursor, direction: int):
         start = cur.selectionStart()
-        end   = cur.selectionEnd()
+        end = cur.selectionEnd()
         cur.setPosition(start)
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         cur.beginEditBlock()
@@ -636,7 +641,7 @@ class CodeEditor(QPlainTextEdit):
                 cur.insertText(" " * self._tab_size)
                 end += self._tab_size
             else:
-                line   = cur.block().text()
+                line = cur.block().text()
                 spaces = len(line) - len(line.lstrip(" "))
                 remove = min(spaces, self._tab_size)
                 for _ in range(remove):
@@ -650,10 +655,10 @@ class CodeEditor(QPlainTextEdit):
         self._indent_lines(self.textCursor(), -1)
 
     def _auto_indent(self):
-        cur  = self.textCursor()
+        cur = self.textCursor()
         line = cur.block().text()
-        n    = len(line) - len(line.lstrip())
-        pad  = " " * n
+        n = len(line) - len(line.lstrip())
+        pad = " " * n
         if self._lang.indent_colon and line.rstrip().endswith(":"):
             pad += " " * self._tab_size
         cur.insertText("\n" + pad)
@@ -733,17 +738,17 @@ class FindReplaceDialog(QDialog):
         root.addLayout(rr)
 
         opts = QHBoxLayout()
-        self._case_cb  = QCheckBox("Match case")
-        self._word_cb  = QCheckBox("Whole word")
+        self._case_cb = QCheckBox("Match case")
+        self._word_cb = QCheckBox("Whole word")
         self._regex_cb = QCheckBox("Regex")
         for cb in (self._case_cb, self._word_cb, self._regex_cb):
             opts.addWidget(cb)
         root.addLayout(opts)
 
         btns = QHBoxLayout()
-        for text, slot in [("Find Next",   self._find_next),
-                           ("Find Prev",   self._find_prev),
-                           ("Replace",     self._replace_one),
+        for text, slot in [("Find Next", self._find_next),
+                           ("Find Prev", self._find_prev),
+                           ("Replace", self._replace_one),
                            ("Replace All", self._replace_all)]:
             b = QPushButton(text)
             b.clicked.connect(slot)
@@ -764,12 +769,12 @@ class FindReplaceDialog(QDialog):
         return f
 
     def _do_find(self, backward: bool) -> QTextCursor:
-        term  = self._find_ed.text()
+        term = self._find_ed.text()
         flags = self._flags()
         if backward:
             flags |= QTextDocument.FindFlag.FindBackward
-        doc   = self._editor.document()
-        cur   = self._editor.textCursor()
+        doc = self._editor.document()
+        cur = self._editor.textCursor()
         found = (doc.find(QRegularExpression(term), cur, flags)
                  if self._regex_cb.isChecked()
                  else doc.find(term, cur, flags))
@@ -809,8 +814,8 @@ class FindReplaceDialog(QDialog):
         term = self._find_ed.text()
         if not term:
             return
-        doc   = self._editor.document()
-        cur   = QTextCursor(doc)
+        doc = self._editor.document()
+        cur = QTextCursor(doc)
         cur.movePosition(QTextCursor.MoveOperation.Start)
         flags = self._flags()
         count = 0
@@ -822,7 +827,7 @@ class FindReplaceDialog(QDialog):
             if found.isNull():
                 break
             found.insertText(self._repl_ed.text())
-            cur   = found
+            cur = found
             count += 1
         cur.endEditBlock()
         self._status.setText(f"Replaced {count} occurrence(s).")
@@ -887,7 +892,7 @@ class CodeEditorWidget(QWidget):
 
         self._build_menus()
         self._build_toolbar()
-        self._build_ui()        # creates splitter, tabs, and symbols panel
+        self._build_ui()  # creates splitter, tabs, and symbols panel
         self._build_statusbar()
 
         QApplication.instance().paletteChanged.connect(self._on_palette_changed)
@@ -901,12 +906,12 @@ class CodeEditorWidget(QWidget):
         self._main_layout.addWidget(self._menu_bar)
 
         fm = self._menu_bar.addMenu("&File")
-        self._act(fm, "&New",       self.add_new_tab,  "Ctrl+N")
-        self._act(fm, "&Open…",     self._open_file,   "Ctrl+O")
+        self._act(fm, "&New", self.add_new_tab, "Ctrl+N")
+        self._act(fm, "&Open…", self._open_file, "Ctrl+O")
         fm.addSeparator()
-        self._act(fm, "&Save",      self._save,        "Ctrl+S")
-        self._act(fm, "Save &As…",  self._save_as,     "Ctrl+Shift+S")
-        self._act(fm, "Save A&ll",  self._save_all,    "Ctrl+Alt+S")
+        self._act(fm, "&Save", self._save, "Ctrl+S")
+        self._act(fm, "Save &As…", self._save_as, "Ctrl+Shift+S")
+        self._act(fm, "Save A&ll", self._save_all, "Ctrl+Alt+S")
         fm.addSeparator()
         self._act(fm, "&Close Tab",
                   lambda: self._close_tab(self._tabs.currentIndex()),
@@ -915,25 +920,25 @@ class CodeEditorWidget(QWidget):
         self._act(fm, "&Quit", self.close, "Ctrl+Q")
 
         em = self._menu_bar.addMenu("&Edit")
-        self._act(em, "&Undo",            self._undo,            "Ctrl+Z")
-        self._act(em, "&Redo",            self._redo,            "Ctrl+Y")
+        self._act(em, "&Undo", self._undo, "Ctrl+Z")
+        self._act(em, "&Redo", self._redo, "Ctrl+Y")
         em.addSeparator()
-        self._act(em, "Cu&t",             self._cut,             "Ctrl+X")
-        self._act(em, "&Copy",            self._copy,            "Ctrl+C")
-        self._act(em, "&Paste",           self._paste,           "Ctrl+V")
-        self._act(em, "Select &All",      self._select_all,      "Ctrl+A")
+        self._act(em, "Cu&t", self._cut, "Ctrl+X")
+        self._act(em, "&Copy", self._copy, "Ctrl+C")
+        self._act(em, "&Paste", self._paste, "Ctrl+V")
+        self._act(em, "Select &All", self._select_all, "Ctrl+A")
         em.addSeparator()
-        self._act(em, "&Find & Replace…", self._show_find,       "Ctrl+H")
-        self._act(em, "Find &Next",       self._find_next_quick, "F3")
-        self._act(em, "Go to &Line…",     self._goto_line,       "Ctrl+G")
+        self._act(em, "&Find & Replace…", self._show_find, "Ctrl+H")
+        self._act(em, "Find &Next", self._find_next_quick, "F3")
+        self._act(em, "Go to &Line…", self._goto_line, "Ctrl+G")
         em.addSeparator()
-        self._act(em, "Toggle &Comment",  self._toggle_comment,  "Ctrl+/")
-        self._act(em, "&Duplicate Line",  self._duplicate_line,  "Ctrl+D")
-        self._act(em, "&Sort Lines",      self._sort_lines)
+        self._act(em, "Toggle &Comment", self._toggle_comment, "Ctrl+/")
+        self._act(em, "&Duplicate Line", self._duplicate_line, "Ctrl+D")
+        self._act(em, "&Sort Lines", self._sort_lines)
 
         vm = self._menu_bar.addMenu("&View")
-        self._act(vm, "Zoom &In",    self._zoom_in,    "Ctrl+=")
-        self._act(vm, "Zoom &Out",   self._zoom_out,   "Ctrl+-")
+        self._act(vm, "Zoom &In", self._zoom_in, "Ctrl+=")
+        self._act(vm, "Zoom &Out", self._zoom_out, "Ctrl+-")
         self._act(vm, "Reset &Zoom", self._zoom_reset, "Ctrl+0")
         vm.addSeparator()
         self._act(vm, "&Font…", self._choose_font)
@@ -966,9 +971,9 @@ class CodeEditorWidget(QWidget):
         self._main_layout.addWidget(self._toolbar)
 
         for label, slot, tip in [
-            ("New",  self.add_new_tab, "New file (Ctrl+N)"),
+            ("New", self.add_new_tab, "New file (Ctrl+N)"),
             ("Open", self._open_file, "Open file (Ctrl+O)"),
-            ("Save", self._save,      "Save (Ctrl+S)"),
+            ("Save", self._save, "Save (Ctrl+S)"),
         ]:
             a = QAction(label, self)
             a.setStatusTip(tip)
@@ -1017,15 +1022,15 @@ class CodeEditorWidget(QWidget):
             self._main_layout.addWidget(self._splitter, stretch=1)
         else:
             self._sym_widget = None
-            self._splitter   = None
+            self._splitter = None
             self._main_layout.addWidget(self._tabs, stretch=1)
 
     def _build_statusbar(self):
         self._status_bar = QStatusBar()
-        self._lbl_pos   = QLabel("Ln 1, Col 1")
+        self._lbl_pos = QLabel("Ln 1, Col 1")
         self._lbl_lines = QLabel("0 lines")
-        self._lbl_lang  = QLabel("Plain Text")
-        self._lbl_enc   = QLabel("UTF-8")
+        self._lbl_lang = QLabel("Plain Text")
+        self._lbl_enc = QLabel("UTF-8")
         for w in (self._lbl_pos, self._lbl_lines,
                   self._lbl_lang, self._lbl_enc):
             self._status_bar.addPermanentWidget(w)
@@ -1065,7 +1070,7 @@ class CodeEditorWidget(QWidget):
     # ── Tab helpers ────────────────────────────────────────────────────────────
 
     def add_new_tab(self, filepath: str | None = None) -> CodeEditor:
-        ed   = CodeEditor()
+        ed = CodeEditor()
         lang = lang_from_extension(filepath) if filepath else PLAIN_TEXT
         ed.cursorPositionChanged.connect(self._update_status)
         ed.document().modificationChanged.connect(self._update_tab_title)
@@ -1074,7 +1079,7 @@ class CodeEditorWidget(QWidget):
         ed.document().contentsChanged.connect(self._sym_timer.start)
 
         title = Path(filepath).name if filepath else "untitled"
-        idx   = self._tabs.addTab(ed, title)
+        idx = self._tabs.addTab(ed, title)
         self._tabs.setCurrentIndex(idx)
 
         ed.set_language(lang)
@@ -1092,7 +1097,7 @@ class CodeEditorWidget(QWidget):
     def _close_tab(self, idx: int):
         ed: CodeEditor = self._tabs.widget(idx)
         if ed.document().isModified():
-            name  = self._tabs.tabText(idx).rstrip("*")
+            name = self._tabs.tabText(idx).rstrip("*")
             reply = QMessageBox.question(
                 self, "Unsaved Changes",
                 f"'{name}' has unsaved changes. Save before closing?",
@@ -1126,7 +1131,7 @@ class CodeEditorWidget(QWidget):
         ed = self._cur()
         if not ed:
             return
-        idx  = self._tabs.currentIndex()
+        idx = self._tabs.currentIndex()
         name = Path(ed.filepath).name if ed.filepath else "untitled"
         self._tabs.setTabText(
             idx, name + ("*" if ed.document().isModified() else ""))
@@ -1163,7 +1168,7 @@ class CodeEditorWidget(QWidget):
         ed.filepath = path
         ed.document().setModified(False)
         self._watcher.addPath(path)
-        idx  = self._tabs.indexOf(ed)
+        idx = self._tabs.indexOf(ed)
         lang = lang_from_extension(path)
         ed.set_language(lang)
         self._tabs.setTabText(idx, Path(path).name)
@@ -1254,12 +1259,23 @@ class CodeEditorWidget(QWidget):
 
     # ── Edit commands ──────────────────────────────────────────────────────────
 
-    def _undo(self):       e = self._cur(); e and e.undo()
-    def _redo(self):       e = self._cur(); e and e.redo()
-    def _cut(self):        e = self._cur(); e and e.cut()
-    def _copy(self):       e = self._cur(); e and e.copy()
-    def _paste(self):      e = self._cur(); e and e.paste()
-    def _select_all(self): e = self._cur(); e and e.selectAll()
+    def _undo(self):
+        e = self._cur(); e and e.undo()
+
+    def _redo(self):
+        e = self._cur(); e and e.redo()
+
+    def _cut(self):
+        e = self._cur(); e and e.cut()
+
+    def _copy(self):
+        e = self._cur(); e and e.copy()
+
+    def _paste(self):
+        e = self._cur(); e and e.paste()
+
+    def _select_all(self):
+        e = self._cur(); e and e.selectAll()
 
     def _toggle_comment(self):
         ed = self._cur()
@@ -1268,9 +1284,9 @@ class CodeEditorWidget(QWidget):
         prefix = ed.language.comment_prefix
         if not prefix:
             return
-        cur   = ed.textCursor()
+        cur = ed.textCursor()
         start = cur.selectionStart()
-        end   = cur.selectionEnd()
+        end = cur.selectionEnd()
         cur.setPosition(start)
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         cur.beginEditBlock()
@@ -1310,9 +1326,9 @@ class CodeEditorWidget(QWidget):
         ed = self._cur()
         if not ed:
             return
-        cur   = ed.textCursor()
+        cur = ed.textCursor()
         start = cur.selectionStart()
-        end   = cur.selectionEnd()
+        end = cur.selectionEnd()
         cur.setPosition(start)
         cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -1357,8 +1373,12 @@ class CodeEditorWidget(QWidget):
 
     # ── View ───────────────────────────────────────────────────────────────────
 
-    def _zoom_in(self):   e = self._cur(); e and e.zoomIn(2)
-    def _zoom_out(self):  e = self._cur(); e and e.zoomOut(2)
+    def _zoom_in(self):
+        e = self._cur(); e and e.zoomIn(2)
+
+    def _zoom_out(self):
+        e = self._cur(); e and e.zoomOut(2)
+
     def _zoom_reset(self):
         ed = self._cur()
         if ed:
@@ -1415,7 +1435,7 @@ class CodeEditorWidget(QWidget):
         for i in range(self._tabs.count()):
             ed: CodeEditor = self._tabs.widget(i)
             if ed.document().isModified():
-                name  = self._tabs.tabText(i).rstrip("*")
+                name = self._tabs.tabText(i).rstrip("*")
                 reply = QMessageBox.question(
                     self, "Unsaved Changes",
                     f"'{name}' has unsaved changes. Save before quitting?",

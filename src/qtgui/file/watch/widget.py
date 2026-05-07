@@ -1,22 +1,31 @@
 from __future__ import annotations
 
+import ctypes
 import mimetypes
+import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
 from PyQt6.QtCore import QDir, QUrl, QModelIndex, QThreadPool
-from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap, QColor
+from PyQt6.QtCore import (
+    Qt, QTimer, QThread, pyqtSignal, QObject
+)
+from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (QHBoxLayout, QAbstractItemView, QMenu,
                              QMessageBox, QTreeView, QToolButton)
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QLabel, QFileDialog
+)
 
 from pycore.files import FileExtensionManager, FileInfo, FileExtensionCategory
 from qtcore.worker import SyncWorker
+from qtgui.edit import SearchLineEdit
 from qtgui.file.watch.models.proxy import FileFilterProxyModel
 from qtgui.file.watch.models.tree import FileTreeModel, FileNode
 from qtgui.file.watch.watcher import DirectoryWatcher
 from qtgui.pixmap import colorize_pixmap
-from qtgui.edit import SearchLineEdit
 
 
 # ---------------------------------------------------------------------------
@@ -61,57 +70,96 @@ def build_file_info(path: Path) -> FileInfo:
         category=category,
     )
 
-import os
-import sys
-import ctypes
-from pathlib import Path
-from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QObject
-)
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QFileDialog
-)
-
 
 # -------------------------------------------------------------------
 # Platform‑specific on‑disk size for a single file
 # -------------------------------------------------------------------
+import ctypes
+import os
+import sys
+
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+
+# -------------------------------------------------------------------
+# Disk allocation helpers
+# -------------------------------------------------------------------
+
+def _get_windows_cluster_size(path: str) -> int:
+    """
+    Return the filesystem cluster size for the volume containing *path*.
+
+    Raises OSError if the Win32 API calls fail.
+    """
+    kernel32 = ctypes.windll.kernel32
+
+    # Use a long buffer so paths longer than MAX_PATH have room.
+    volume_root = ctypes.create_unicode_buffer(32768)
+
+    abs_path = os.path.abspath(path)
+
+    if not kernel32.GetVolumePathNameW(
+        ctypes.c_wchar_p(abs_path),
+        volume_root,
+        len(volume_root),
+    ):
+        raise ctypes.WinError()
+
+    sectors_per_cluster = ctypes.c_ulong(0)
+    bytes_per_sector = ctypes.c_ulong(0)
+    free_clusters = ctypes.c_ulong(0)
+    total_clusters = ctypes.c_ulong(0)
+
+    if not kernel32.GetDiskFreeSpaceW(
+        ctypes.c_wchar_p(volume_root.value),
+        ctypes.byref(sectors_per_cluster),
+        ctypes.byref(bytes_per_sector),
+        ctypes.byref(free_clusters),
+        ctypes.byref(total_clusters),
+    ):
+        raise ctypes.WinError()
+
+    cluster_size = sectors_per_cluster.value * bytes_per_sector.value
+    if cluster_size <= 0:
+        raise OSError("Invalid cluster size returned by GetDiskFreeSpaceW")
+
+    return cluster_size
+
+
 def get_file_on_disk_size(file_path: str) -> int:
     """
-    Return the 'size on disk' for a single file.
-    On Unix: st_blocks * 512
-    On Windows: file size rounded up to the volume cluster size
+    Return the approximate allocated size, or "size on disk", for one file.
+
+    Unix:
+        Uses st_blocks * 512 when available.
+
+    Windows:
+        Uses logical file size rounded up to the filesystem cluster size.
+
+    Notes:
+        Windows sparse, compressed, deduplicated, cloud-placeholder, and
+        special filesystem files may not match Explorer exactly.
     """
     try:
-        if sys.platform == 'win32':
-            # Get the volume cluster size using GetDiskFreeSpaceW
-            drive = os.path.splitdrive(file_path)[0] + '\\'
-            if not drive:
-                drive = None  # current drive default
-
-            sectors_per_cluster = ctypes.c_ulonglong(0)
-            bytes_per_sector = ctypes.c_ulonglong(0)
-            free_clusters = ctypes.c_ulonglong(0)
-            total_clusters = ctypes.c_ulonglong(0)
-
-            kernel32 = ctypes.windll.kernel32
-            kernel32.GetDiskFreeSpaceW(
-                ctypes.c_wchar_p(drive),
-                ctypes.byref(sectors_per_cluster),
-                ctypes.byref(bytes_per_sector),
-                ctypes.byref(free_clusters),
-                ctypes.byref(total_clusters)
-            )
-            cluster_size = sectors_per_cluster.value * bytes_per_sector.value
-
+        if sys.platform == "win32":
             file_size = os.path.getsize(file_path)
             if file_size == 0:
                 return 0
+
+            cluster_size = _get_windows_cluster_size(file_path)
             return ((file_size + cluster_size - 1) // cluster_size) * cluster_size
-        else:
-            # Unix (Linux, macOS)
-            stat = os.stat(file_path)
-            return stat.st_blocks * 512
+
+        stat_result = os.stat(file_path, follow_symlinks=False)
+
+        # st_blocks is standard on Unix-like systems, but use st_size as a
+        # fallback for unusual platforms/filesystems where it is unavailable.
+        blocks = getattr(stat_result, "st_blocks", None)
+        if blocks is not None:
+            return blocks * 512
+
+        return stat_result.st_size
+
     except OSError:
         return 0
 
@@ -119,13 +167,27 @@ def get_file_on_disk_size(file_path: str) -> int:
 # -------------------------------------------------------------------
 # Worker that computes total size in a thread
 # -------------------------------------------------------------------
-class SizeCalculator(QObject):
-    result_ready = pyqtSignal(int)   # total bytes (on disk)
-    finished = pyqtSignal()
 
-    def __init__(self, root_path: str):
+class SizeCalculator(QObject):
+    """
+    Background worker that calculates allocated disk size.
+
+    Signals
+    -------
+    result_ready(generation, total_bytes)
+        Emitted only if the worker was not cancelled.
+
+    finished(generation)
+        Always emitted when the worker exits.
+    """
+
+    result_ready = pyqtSignal(int, int)
+    finished = pyqtSignal(int)
+
+    def __init__(self, root_path: str, generation: int):
         super().__init__()
         self.root_path = root_path
+        self.generation = generation
         self._is_running = True
 
     def stop(self):
@@ -133,169 +195,244 @@ class SizeCalculator(QObject):
 
     def calculate(self):
         total = 0
-        try:
-            for entry in os.scandir(self.root_path):
-                if not self._is_running:
-                    break
-                if entry.is_file(follow_symlinks=False):
-                    total += get_file_on_disk_size(entry.path)
-                elif entry.is_dir(follow_symlinks=False):
-                    total += self._calc_dir_size(entry.path)
-        except PermissionError:
-            pass
-        if self._is_running:
-            self.result_ready.emit(total)
-        self.finished.emit()
 
-    def _calc_dir_size(self, dir_path: str) -> int:
-        total = 0
         try:
-            for entry in os.scandir(dir_path):
-                if not self._is_running:
-                    return 0
-                if entry.is_file(follow_symlinks=False):
-                    total += get_file_on_disk_size(entry.path)
-                elif entry.is_dir(follow_symlinks=False):
-                    total += self._calc_dir_size(entry.path)
-        except PermissionError:
-            pass
-        return total
+            if os.path.isfile(self.root_path):
+                if self._is_running:
+                    total = get_file_on_disk_size(self.root_path)
+
+            elif os.path.isdir(self.root_path):
+                total = self._calc_dir_size_iterative(self.root_path)
+
+        except OSError:
+            total = 0
+
+        if self._is_running:
+            self.result_ready.emit(self.generation, total)
+
+        self.finished.emit(self.generation)
+
+    def _calc_dir_size_iterative(self, root_dir: str) -> int:
+        """
+        Iteratively scan a directory tree.
+
+        This avoids Python recursion limits and handles disappearing files,
+        permission errors, and broken entries gracefully.
+        """
+        total = 0
+        stack = [root_dir]
+
+        while stack and self._is_running:
+            dir_path = stack.pop()
+
+            try:
+                with os.scandir(dir_path) as entries:
+                    for entry in entries:
+                        if not self._is_running:
+                            return 0
+
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total += get_file_on_disk_size(entry.path)
+
+                            elif entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+
+                        except OSError:
+                            # Entry may disappear, be inaccessible, or fail
+                            # metadata lookup. Ignore and continue.
+                            continue
+
+            except OSError:
+                # Permission denied, deleted directory, invalid path, etc.
+                continue
+
+        return total if self._is_running else 0
 
 
 # -------------------------------------------------------------------
 # Main monitoring widget
 # -------------------------------------------------------------------
+
 class FolderSizeMonitor(QWidget):
     """
-    A PyQt6 widget that actively monitors the on‑disk size of a folder.
+    A PyQt6 widget that actively monitors the on-disk size of a folder.
 
     Usage:
         monitor = FolderSizeMonitor()
-        monitor.set_path('/path/to/folder')   # starts monitoring
-        monitor.stop()                        # stops monitoring
+        monitor.set_path("/path/to/folder")
+        monitor.stop()
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, interval_ms: int = 1000):
         super().__init__(parent)
 
-        # UI layout
+        self.interval_ms = interval_ms
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-
         self.size_label = QLabel("Size: --")
         self.size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         layout.addWidget(self.size_label)
 
-        # Internal state
-        self.current_path = None
+        self.current_path: str | None = None
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._trigger_update)
-        self._worker_thread = None
-        self._worker = None
+
+        self._worker_thread: QThread | None = None
+        self._worker: SizeCalculator | None = None
+
+        # Incremented whenever monitoring is reset/stopped so stale queued
+        # signals from previous workers cannot update the label.
+        self._generation = 0
 
     def set_path(self, path: str):
-        """Set the folder to monitor and start updating immediately."""
-        self.stop()                        # stop any previous monitoring
+        """
+        Set the file or folder to monitor and start updating immediately.
+        """
+        self.stop()
+
         self.current_path = path
+        self._generation += 1
+
+        if not path or not os.path.exists(path):
+            self.size_label.setText("Size: --")
+            return
+
         self._start_monitoring()
 
     def stop(self):
-        """Stop monitoring and clean up the background worker."""
+        """
+        Stop monitoring and request background worker cancellation.
+
+        This method never deletes a still-running QThread. If the worker does
+        not stop within the timeout, cleanup is completed when the worker
+        eventually emits finished.
+        """
         self._timer.stop()
+        self._generation += 1
 
-        # Stop the worker (if running)
         worker = self._worker
-        if worker:
-            worker.stop()
-            # Disconnect signals to avoid queued calls after cleanup
-            try:
-                worker.finished.disconnect(self._on_calculation_finished)
-            except (TypeError, RuntimeError):
-                pass
-            self._worker = None
-
-        # Quit and wait for the worker thread
         thread = self._worker_thread
-        if thread:
+
+        if worker is not None:
+            worker.stop()
+
+        if thread is not None:
             thread.quit()
-            thread.wait(2000)
-            thread.deleteLater()
-            self._worker_thread = None
+
+            if thread.wait(2000):
+                # Thread has stopped. Normal signal-based deleteLater cleanup
+                # may already be queued, but clearing references is safe.
+                self._worker = None
+                self._worker_thread = None
+            else:
+                # Do not delete or null the running thread. It will be cleaned
+                # up in _clear_worker_refs() after finished is emitted.
+                pass
 
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
 
     def _start_monitoring(self):
-        """Begin periodic updates (every 1 second)."""
-        self._timer.start(1000)
-        self._trigger_update()   # immediate first update
+        self._timer.start(self.interval_ms)
+        self._trigger_update()
 
     def _trigger_update(self):
-        """Start a background size calculation if not already running."""
+        """
+        Start a background size calculation if one is not already running.
+        """
         if not self.current_path:
             return
-        # Only allow one calculation at a time
-        if self._worker_thread and self._worker_thread.isRunning():
+
+        if not os.path.exists(self.current_path):
+            self.size_label.setText("Size: --")
             return
 
-        # If there’s a leftover thread (shouldn't happen), clean it
-        if self._worker_thread:
-            self._worker_thread.quit()
-            self._worker_thread.wait()
-            self._worker_thread.deleteLater()
+        # Only allow one calculation at a time.
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            return
+
+        # Clear any stale non-running thread reference.
+        if self._worker_thread is not None:
+            self._worker_thread = None
+            self._worker = None
+
+        generation = self._generation
+
+        thread = QThread(self)
+        worker = SizeCalculator(self.current_path, generation)
+        worker.moveToThread(thread)
+
+        self._worker_thread = thread
+        self._worker = worker
+
+        thread.started.connect(worker.calculate)
+
+        worker.result_ready.connect(self._update_size_label)
+
+        # Safe Qt cleanup pattern.
+        worker.finished.connect(lambda _gen: thread.quit())
+        worker.finished.connect(lambda _gen: worker.deleteLater())
+        thread.finished.connect(thread.deleteLater)
+
+        # Clear Python references after the thread finishes.
+        thread.finished.connect(
+            lambda t=thread, w=worker, g=generation: self._clear_worker_refs(t, w, g)
+        )
+
+        thread.start()
+
+    def _clear_worker_refs(
+        self,
+        thread: QThread,
+        worker: SizeCalculator,
+        generation: int,
+    ):
+        """
+        Clear worker/thread refs only if they still refer to this calculation.
+        """
+        if self._worker_thread is thread:
             self._worker_thread = None
 
-        # Create worker and thread
-        self._worker_thread = QThread()
-        self._worker = SizeCalculator(self.current_path)
-        self._worker.moveToThread(self._worker_thread)
+        if self._worker is worker:
+            self._worker = None
 
-        self._worker_thread.started.connect(self._worker.calculate)
-        self._worker.result_ready.connect(self._update_size_label)
-        # Handle cleanup when the worker finishes
-        self._worker.finished.connect(self._on_calculation_finished)
+    def _update_size_label(self, generation: int, total_bytes: int):
+        """
+        Convert bytes to a human-readable string and update the label.
 
-        self._worker_thread.start()
+        Stale results from older workers are ignored.
+        """
+        if generation != self._generation:
+            return
 
-    def _on_calculation_finished(self):
-        """Clean up worker and its thread after calculation ends."""
-        if not self._worker or not self._worker_thread:
-            return   # stop() already cleaned up
+        self.size_label.setText(
+            f"Size on disk: {self._format_bytes(total_bytes)}"
+        )
 
-        worker = self._worker
-        thread = self._worker_thread
-
-        # Stop the worker (redundant but safe)
-        worker.stop()
-
-        # Disconnect to prevent re‑entry
-        try:
-            worker.finished.disconnect(self._on_calculation_finished)
-        except (TypeError, RuntimeError):
-            pass
-
-        thread.quit()
-        thread.wait()
-        thread.deleteLater()
-
-        self._worker = None
-        self._worker_thread = None
-
-    def _update_size_label(self, total_bytes: int):
-        """Convert bytes to a human‑readable string and update the label."""
+    @staticmethod
+    def _format_bytes(total_bytes: int) -> str:
         if total_bytes < 1024:
-            text = f"{total_bytes} B"
-        elif total_bytes < 1024 ** 2:
-            text = f"{total_bytes / 1024:.1f} KB"
-        elif total_bytes < 1024 ** 3:
-            text = f"{total_bytes / (1024 ** 2):.1f} MB"
-        else:
-            text = f"{total_bytes / (1024 ** 3):.2f} GB"
-        self.size_label.setText(f"Size on disk: {text}")
+            return f"{total_bytes} B"
 
+        if total_bytes < 1024 ** 2:
+            return f"{total_bytes / 1024:.2f} KB"
+
+        if total_bytes < 1024 ** 3:
+            return f"{total_bytes / (1024 ** 2):.2f} MB"
+
+        if total_bytes < 1024 ** 4:
+            return f"{total_bytes / (1024 ** 3):.2f} GB"
+
+        return f"{total_bytes / (1024 ** 4):.2f} TB"
+
+    def closeEvent(self, event):
+        self.stop()
+        super().closeEvent(event)
 
 # ---------------------------------------------------------------------------
 # Widget
@@ -339,7 +476,8 @@ class DirectoryWidget(QWidget):
         # ── Toolbar button ───────────────────────────────────────────────
         self._dir_btn = QToolButton()
         self._dir_btn.setIcon(QIcon(colorize_pixmap(
-            QPixmap("line-icons:folder-add.svg"), self.palette().highlight().color())))
+            QPixmap("line-icons:folder-add.svg"),
+            self.palette().highlight().color())))
         self._dir_btn.setStyleSheet("""background-color: palette(base);""")
         self._dir_btn.clicked.connect(self._choose_directory)
         self._dir_btn.setMaximumWidth(40)
@@ -356,10 +494,10 @@ class DirectoryWidget(QWidget):
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.addWidget(self._dir_btn)
         h_layout.addStretch()
-        h_layout.addWidget(self._path_size, alignment=Qt.AlignmentFlag.AlignRight)
+        h_layout.addWidget(self._path_size,
+                           alignment=Qt.AlignmentFlag.AlignRight)
         layout.addLayout(h_layout)
         self.setMinimumWidth(200)
-
 
         # ── Thread pool & worker registry ────────────────────────────────
         # _active_workers keeps a strong reference so the GC cannot collect

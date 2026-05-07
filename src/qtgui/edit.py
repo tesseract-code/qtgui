@@ -1,9 +1,8 @@
-from PIL.ImageQt import QPixmap
-from PyQt6.QtCore import pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QDoubleValidator, QColor, QIcon
+from PyQt6.QtCore import pyqtSignal, pyqtSlot, QSize
+from PyQt6.QtGui import QDoubleValidator, QIcon
 from PyQt6.QtWidgets import QLineEdit
 
-from qtgui.pixmap import colorize_pixmap
+from qtgui.icons import _get_line_icon
 
 
 class ScientificLineEdit(QLineEdit):
@@ -89,17 +88,17 @@ class ScientificLineEdit(QLineEdit):
 class SearchLineEdit(QLineEdit):
     def __init__(self, placeholder: str = "Search...", parent=None):
         super().__init__(parent=parent)
+
+        icon = QIcon(
+            _get_line_icon(
+                "search-line",
+                QSize(256, 256),
+                self.palette().highlight().color()
+            )
+        )
+
         self.addAction(
-            QIcon(
-                colorize_pixmap(QPixmap(
-                    "line-icons:search-line.svg"
-                ),
-                    QColor(
-                        self.palette().highlight().color()
-                    )
-                )
-            ),
+            icon,
             QLineEdit.ActionPosition.LeadingPosition)
         self.setPlaceholderText(placeholder)
-        self.setStyleSheet("border-radius: 4px;")
         self.setClearButtonEnabled(True)
