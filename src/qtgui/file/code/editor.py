@@ -61,7 +61,7 @@ except ImportError:
     _SYMBOLS_AVAILABLE = False
 
 # Maps editor LangInfo.name → symbols_view language tag accepted by load_source
-_LANG_TO_SYMBOLS: dict[str, str] = {
+LANG_TO_SYMBOLS: dict[str, str] = {
     "Python": "python",
     "SQL": "sql",
     "C / C++": "cpp",
@@ -914,7 +914,7 @@ class CodeEditorWidget(QWidget):
         self._act(fm, "Save A&ll", self._save_all, "Ctrl+Alt+S")
         fm.addSeparator()
         self._act(fm, "&Close Tab",
-                  lambda: self._close_tab(self._tabs.currentIndex()),
+                  lambda: self._close_tab(self.tabs.currentIndex()),
                   "Ctrl+W")
         fm.addSeparator()
         self._act(fm, "&Quit", self.close, "Ctrl+Q")
@@ -999,12 +999,12 @@ class CodeEditorWidget(QWidget):
         self._toolbar.addWidget(self._tab_spin)
 
     def _build_ui(self):
-        self._tabs = QTabWidget()
-        self._tabs.setTabsClosable(True)
-        self._tabs.setMovable(True)
-        self._tabs.setDocumentMode(True)
-        self._tabs.tabCloseRequested.connect(self._close_tab)
-        self._tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         if self._show_symbols:
             # Left panel: symbols; right panel: editor tabs
@@ -1014,7 +1014,7 @@ class CodeEditorWidget(QWidget):
 
             self._splitter = QSplitter(Qt.Orientation.Horizontal)
             self._splitter.addWidget(self._sym_widget)
-            self._splitter.addWidget(self._tabs)
+            self._splitter.addWidget(self.tabs)
             # Symbols panel starts at ~220 px; editor takes the rest
             self._splitter.setSizes([220, 9999])
             self._splitter.setCollapsible(0, True)
@@ -1023,7 +1023,7 @@ class CodeEditorWidget(QWidget):
         else:
             self._sym_widget = None
             self._splitter = None
-            self._main_layout.addWidget(self._tabs, stretch=1)
+            self._main_layout.addWidget(self.tabs, stretch=1)
 
     def _build_statusbar(self):
         self._status_bar = QStatusBar()
@@ -1047,7 +1047,7 @@ class CodeEditorWidget(QWidget):
             self._sym_widget.clear()
             return
 
-        lang_tag = _LANG_TO_SYMBOLS.get(ed.language.name)
+        lang_tag = LANG_TO_SYMBOLS.get(ed.language.name)
         if lang_tag is None:
             # Plain Text or an unsupported language — clear the panel
             self._sym_widget.clear()
@@ -1079,8 +1079,8 @@ class CodeEditorWidget(QWidget):
         ed.document().contentsChanged.connect(self._sym_timer.start)
 
         title = Path(filepath).name if filepath else "untitled"
-        idx = self._tabs.addTab(ed, title)
-        self._tabs.setCurrentIndex(idx)
+        idx = self.tabs.addTab(ed, title)
+        self.tabs.setCurrentIndex(idx)
 
         ed.set_language(lang)
 
@@ -1091,13 +1091,13 @@ class CodeEditorWidget(QWidget):
         return ed
 
     def _cur(self) -> CodeEditor | None:
-        w = self._tabs.currentWidget()
+        w = self.tabs.currentWidget()
         return w if isinstance(w, CodeEditor) else None
 
     def _close_tab(self, idx: int):
-        ed: CodeEditor = self._tabs.widget(idx)
+        ed: CodeEditor = self.tabs.widget(idx)
         if ed.document().isModified():
-            name = self._tabs.tabText(idx).rstrip("*")
+            name = self.tabs.tabText(idx).rstrip("*")
             reply = QMessageBox.question(
                 self, "Unsaved Changes",
                 f"'{name}' has unsaved changes. Save before closing?",
@@ -1108,12 +1108,12 @@ class CodeEditorWidget(QWidget):
             if reply == QMessageBox.StandardButton.Cancel:
                 return
             if reply == QMessageBox.StandardButton.Save:
-                self._tabs.setCurrentIndex(idx)
+                self.tabs.setCurrentIndex(idx)
                 self._save()
         if ed.filepath and ed.filepath in self._watcher.files():
             self._watcher.removePath(ed.filepath)
-        self._tabs.removeTab(idx)
-        if self._tabs.count() == 0:
+        self.tabs.removeTab(idx)
+        if self.tabs.count() == 0:
             self.add_new_tab()
 
     def _on_tab_changed(self, _idx: int):
@@ -1131,9 +1131,9 @@ class CodeEditorWidget(QWidget):
         ed = self._cur()
         if not ed:
             return
-        idx = self._tabs.currentIndex()
+        idx = self.tabs.currentIndex()
         name = Path(ed.filepath).name if ed.filepath else "untitled"
-        self._tabs.setTabText(
+        self.tabs.setTabText(
             idx, name + ("*" if ed.document().isModified() else ""))
 
     # ── Language combo ─────────────────────────────────────────────────────────
@@ -1168,11 +1168,11 @@ class CodeEditorWidget(QWidget):
         ed.filepath = path
         ed.document().setModified(False)
         self._watcher.addPath(path)
-        idx = self._tabs.indexOf(ed)
+        idx = self.tabs.indexOf(ed)
         lang = lang_from_extension(path)
         ed.set_language(lang)
-        self._tabs.setTabText(idx, Path(path).name)
-        self._tabs.setTabToolTip(idx, path)
+        self.tabs.setTabText(idx, Path(path).name)
+        self.tabs.setTabToolTip(idx, path)
         self._sync_lang_combo(lang)
         self._refresh_symbols()
 
@@ -1188,10 +1188,10 @@ class CodeEditorWidget(QWidget):
             "Text (*.txt)",
         )
         for path in paths:
-            for i in range(self._tabs.count()):
-                ed: CodeEditor = self._tabs.widget(i)
+            for i in range(self.tabs.count()):
+                ed: CodeEditor = self.tabs.widget(i)
                 if ed.filepath == path:
-                    self._tabs.setCurrentIndex(i)
+                    self.tabs.setCurrentIndex(i)
                     break
             else:
                 self.add_new_tab(path)
@@ -1223,11 +1223,11 @@ class CodeEditorWidget(QWidget):
         return self._write(ed, path)
 
     def _save_all(self):
-        saved = self._tabs.currentIndex()
-        for i in range(self._tabs.count()):
-            self._tabs.setCurrentIndex(i)
+        saved = self.tabs.currentIndex()
+        for i in range(self.tabs.count()):
+            self.tabs.setCurrentIndex(i)
             self._save()
-        self._tabs.setCurrentIndex(saved)
+        self.tabs.setCurrentIndex(saved)
 
     def _write(self, ed: CodeEditor, path: str) -> bool:
         try:
@@ -1244,8 +1244,8 @@ class CodeEditorWidget(QWidget):
         return True
 
     def _on_file_changed(self, path: str):
-        for i in range(self._tabs.count()):
-            ed: CodeEditor = self._tabs.widget(i)
+        for i in range(self.tabs.count()):
+            ed: CodeEditor = self.tabs.widget(i)
             if ed.filepath == path:
                 reply = QMessageBox.question(
                     self, "File Changed",
@@ -1422,8 +1422,8 @@ class CodeEditorWidget(QWidget):
     # ── Palette ────────────────────────────────────────────────────────────────
 
     def _on_palette_changed(self, _pal: QPalette):
-        for i in range(self._tabs.count()):
-            ed: CodeEditor = self._tabs.widget(i)
+        for i in range(self.tabs.count()):
+            ed: CodeEditor = self.tabs.widget(i)
             ed._highlight_current_line()
             if ed._highlighter:
                 ed._highlighter.rehighlight()
@@ -1432,10 +1432,10 @@ class CodeEditorWidget(QWidget):
 
     def closeEvent(self, event):
         self._sym_timer.stop()
-        for i in range(self._tabs.count()):
-            ed: CodeEditor = self._tabs.widget(i)
+        for i in range(self.tabs.count()):
+            ed: CodeEditor = self.tabs.widget(i)
             if ed.document().isModified():
-                name = self._tabs.tabText(i).rstrip("*")
+                name = self.tabs.tabText(i).rstrip("*")
                 reply = QMessageBox.question(
                     self, "Unsaved Changes",
                     f"'{name}' has unsaved changes. Save before quitting?",
@@ -1447,7 +1447,7 @@ class CodeEditorWidget(QWidget):
                     event.ignore()
                     return
                 if reply == QMessageBox.StandardButton.Save:
-                    self._tabs.setCurrentIndex(i)
+                    self.tabs.setCurrentIndex(i)
                     if not self._save():
                         event.ignore()
                         return

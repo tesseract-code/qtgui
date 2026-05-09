@@ -31,7 +31,7 @@ class ModelToolBar(QToolBar):
         def _btn(label, slot, icon_name):
             b = QToolButton()
             b.setToolTip(label)
-            b.setIcon(_get_line_icon(icon_name, color=self.palette().highlightedText().color()))
+            b.setIcon(_get_line_icon(icon_name, color=self.palette().accent().color()))
             b.clicked.connect(slot)
             self.addWidget(b)
             return b
@@ -45,7 +45,7 @@ class ModelToolBar(QToolBar):
         self._wire_btn.setCheckable(True)
         self._wire_btn.setIcon(
             _get_line_icon("global-line",
-                           color=self.palette().highlightedText().color()))
+                           color=self.palette().accent().color()))
         self._wire_btn.setToolTip("Toggle wireframe/solid")
         self._wire_btn.toggled.connect(self.wireframeToggled.emit)
         self.addWidget(self._wire_btn)
@@ -53,7 +53,7 @@ class ModelToolBar(QToolBar):
         self._grid_btn.setCheckable(True)
         self._grid_btn.setIcon(
             _get_line_icon("grid-line",
-                           color=self.palette().highlightedText().color()))
+                           color=self.palette().accent().color()))
         self._grid_btn.setToolTip("Toggle bounding-box grid")
         self._grid_btn.toggled.connect(self.gridToggled.emit)
         self.addWidget(self._grid_btn)

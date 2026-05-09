@@ -1,15 +1,30 @@
+from __future__ import annotations
+
+"""
+qtgui/terminal/utils.py — cross-platform terminal utilities
+============================================================
+
+  Platform       PTY available   Shell
+  -------------- --------------- ---------------------------------
+  Linux / macOS  Yes (pty+pyte)  zsh / bash / sh (first found)
+  Windows        Yes (pywinpty)  PowerShell / cmd.exe
+"""
+
 import re
 import shutil
 import struct
+import sys
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeyEvent
 
 from pycore.platform import IS_MACOS, IS_UNIX
 
+# ---------------------------------------------------------------------------
+# Platform-specific low-level imports
+# ---------------------------------------------------------------------------
 if IS_UNIX:
     import fcntl
-    import struct
     import termios
 
     try:
@@ -18,24 +33,63 @@ if IS_UNIX:
         HAS_PTY = True
     except ImportError:
         HAS_PTY = False
-else:
-    HAS_PTY = False
 
+else:  # Windows
+    HAS_PTY = True   # pywinpty provides PTY support; see pty_process.py
+
+    try:
+        import winpty as _winpty  # noqa: F401 — confirm it is installed
+    except ImportError:
+        HAS_PTY = False
+
+
+# ---------------------------------------------------------------------------
+# 1. SHELL RESOLUTION
+# ---------------------------------------------------------------------------
 
 def _resolve_shell() -> str:
-    """Return the first usable shell binary, falling back to /bin/sh."""
-    candidates = (
-        "/bin/zsh" if IS_MACOS else "/bin/bash",
-        "/bin/bash",
-        "/bin/sh",
-    )
-    for candidate in candidates:
-        if shutil.which(candidate):
-            return candidate
-    return "/bin/sh"   # last-resort; always present on POSIX
+    """Return the best available interactive shell for the current platform."""
+    if IS_UNIX:
+        candidates = (
+            "/bin/zsh" if IS_MACOS else "/bin/bash",
+            "/bin/bash",
+            "/bin/sh",
+        )
+        for c in candidates:
+            if shutil.which(c):
+                return c
+        return "/bin/sh"   # always present on POSIX
+
+    # Windows — prefer PowerShell Core → Windows PowerShell → cmd.exe
+    candidates_win = ("pwsh", "powershell", "cmd")
+    for c in candidates_win:
+        resolved = shutil.which(c)
+        if resolved:
+            return resolved
+    return "cmd.exe"       # guaranteed to exist on every Windows install
 
 
-SHELL = _resolve_shell()
+SHELL: str = _resolve_shell()
+
+
+# ---------------------------------------------------------------------------
+# 2. WINDOW-SIZE  (Unix: ioctl; Windows: no-op — pywinpty owns resizing)
+# ---------------------------------------------------------------------------
+
+if IS_UNIX:
+    def _set_winsize(fd: int, rows: int, cols: int) -> None:
+        """Push terminal dimensions to the kernel via TIOCSWINSZ."""
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+else:
+    def _set_winsize(fd: int, rows: int, cols: int) -> None:  # type: ignore[misc]
+        """No-op on Windows — pywinpty handles resizing via proc.setwinsize()."""
+
+
+# ---------------------------------------------------------------------------
+# 3. SHELL COMPLETIONS  (tab-complete suggestions per platform)
+# ---------------------------------------------------------------------------
 
 UNIX_COMPLETIONS: list[str] = [
     "ls -la", "cd", "pwd", "mkdir", "rm -rf", "cp", "mv", "touch", "grep",
@@ -46,23 +100,50 @@ UNIX_COMPLETIONS: list[str] = [
     "less", "man", "history", "clear", "exit", "python3", "pip3 install",
 ]
 
-TUI_PROGRAMS = frozenset([
+WIN_COMPLETIONS: list[str] = [
+    "dir", "cd", "cls", "mkdir", "rmdir /s /q", "copy", "move", "del",
+    "type", "find", "findstr", "ipconfig", "ping", "tracert", "netstat",
+    "tasklist", "taskkill /f /pid", "powershell", "where",
+    "git status", "git add .", "git commit -m", "git push", "git pull",
+    "winget install", "winget upgrade --all", "choco install",
+    "python", "pip install", "py -m venv", "notepad", "explorer",
+    "wsl", "exit",
+]
+
+# Unified alias — use this in code that should work on both platforms.
+COMPLETIONS: list[str] = UNIX_COMPLETIONS if IS_UNIX else WIN_COMPLETIONS
+
+
+# ---------------------------------------------------------------------------
+# 4. TUI / INTERACTIVE PROGRAMS
+#    Used to decide whether to launch a PTY instead of a plain QProcess pipe.
+# ---------------------------------------------------------------------------
+
+_TUI_UNIX = frozenset([
     "nano", "vim", "vi", "nvim", "emacs", "htop", "top", "less", "more",
     "man", "lynx", "mutt", "mc", "ncdu", "ranger", "cmus", "w3m",
 ])
 
+_TUI_WIN = frozenset([
+    "python", "ipython", "node", "powershell", "pwsh",
+    # Windows doesn't really have ncurses TUI tools, but these are
+    # interactive REPLs that need a PTY.
+])
+
+TUI_PROGRAMS: frozenset[str] = _TUI_UNIX if IS_UNIX else _TUI_WIN
+
+
+# ---------------------------------------------------------------------------
+# 5. ANSI / COLOUR UTILITIES
+# ---------------------------------------------------------------------------
+
 # CSI sequences + OSC sequences (window title / hyperlinks) + misc
 _ANSI_RE = re.compile(
-    r"\x1b\[[0-9;]*[A-Za-z]"                        # CSI  ESC [ … letter
+    r"\x1b\[[0-9;]*[A-Za-z]"               # CSI  ESC [ … letter
     r"|\x1b[()][AB012]"
     r"|\x1b[=>]"
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"           # OSC  ESC ] … BEL|ST
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC  ESC ] … BEL|ST
 )
-
-
-# ---------------------------------------------------------------------------
-# 2. COLOUR UTILITIES
-# ---------------------------------------------------------------------------
 
 _ANSI_16: dict[str, str] = {
     "black":          "#2e3436",
@@ -116,33 +197,7 @@ def strip_ansi(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. TERMINAL HISTORY  (pure Python — no Qt dependency, disk-persistent)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 4. TERMINAL PROCESS  (regular commands via QProcess / anonymous pipes)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 5. PTY PROCESS  (TUI / interactive programs — Unix only)
-# ---------------------------------------------------------------------------
-
-
-def _set_winsize(fd: int, rows: int, cols: int) -> None:
-    winsize = struct.pack("HHHH", rows, cols, 0, 0)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
-
-
-# ---------------------------------------------------------------------------
-# 6. TERMINAL DISPLAY  (rendering only — no business logic)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 7. KEY → BYTES MAP  (Qt key codes → terminal escape sequences)
-#    Class-level constant on TerminalWidget; defined here for readability.
+# 6. KEY → BYTES MAP
 # ---------------------------------------------------------------------------
 
 _KEY_MAP: dict[Qt.Key, bytes] = {
@@ -181,4 +236,3 @@ def _key_to_bytes(event: QKeyEvent) -> bytes:
             return bytes([ord(text) & 0x1F])
     text = event.text()
     return text.encode("utf-8") if text else b""
-

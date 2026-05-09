@@ -506,85 +506,6 @@ class _SymbolDelegate(QStyledItemDelegate):
 # Main widget
 # ---------------------------------------------------------------------------
 
-_STYLE = """
-QWidget#SymbolsWidget {
-    background: #282C34;
-}
-
-QLineEdit#FilterEdit {
-    background: #21252B;
-    color: #ABB2BF;
-    border: 1px solid #3E4452;
-    border-radius: 4px;
-    padding: 4px 8px;
-    font-size: 12px;
-    selection-background-color: #3E4452;
-}
-QLineEdit#FilterEdit:focus {
-    border-color: #61AFEF;
-}
-QLineEdit#FilterEdit::placeholder {
-    color: #5C6370;
-}
-
-QTreeView#SymbolTree {
-    background: #282C34;
-    alternate-background-color: #2C313A;
-    color: #ABB2BF;
-    border: none;
-    font-size: 12px;
-    show-decoration-selected: 1;
-    outline: none;
-}
-QTreeView#SymbolTree::item {
-    padding: 2px 0;
-    border-radius: 3px;
-}
-QTreeView#SymbolTree::item:selected {
-    background: #3E4452;
-    color: #E5C07B;
-}
-QTreeView#SymbolTree::item:hover:!selected {
-    background: #2C313A;
-}
-QTreeView#SymbolTree::branch {
-    background: #282C34;
-}
-QTreeView#SymbolTree::branch:has-children:!has-siblings:closed,
-QTreeView#SymbolTree::branch:closed:has-children:has-siblings {
-    image: url(none);
-    border-image: none;
-}
-QHeaderView::section {
-    background: #21252B;
-    color: #5C6370;
-    border: none;
-    border-bottom: 1px solid #3E4452;
-    padding: 3px 6px;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-QPushButton#ToolBtn {
-    background: transparent;
-    color: #5C6370;
-    border: none;
-    border-radius: 3px;
-    padding: 2px 6px;
-    font-size: 12px;
-}
-QPushButton#ToolBtn:hover  { background: #3E4452; color: #ABB2BF; }
-QPushButton#ToolBtn:pressed{ background: #2C313A; }
-QPushButton#ToolBtn:checked{ color: #61AFEF; }
-
-QLabel#LangBadge {
-    color: #5C6370;
-    font-size: 10px;
-    padding: 0 4px;
-}
-"""
-
 
 class SymbolsWidget(QWidget):
     """
@@ -614,7 +535,6 @@ class SymbolsWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _setup_ui(self) -> None:
-        self.setStyleSheet(_STYLE)
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
@@ -622,7 +542,6 @@ class SymbolsWidget(QWidget):
         # ── Toolbar ──────────────────────────────────────────────────
         toolbar = QWidget()
         toolbar.setFixedHeight(36)
-        toolbar.setStyleSheet("background:#21252B; border-bottom:1px solid #3E4452;")
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(6, 4, 6, 4)
         tb_layout.setSpacing(4)
@@ -694,10 +613,6 @@ class SymbolsWidget(QWidget):
 
         # ── Status bar ───────────────────────────────────────────────
         self._status = QLabel("No file loaded")
-        self._status.setStyleSheet(
-            "background:#21252B; color:#5C6370; border-top:1px solid #3E4452;"
-            "padding:2px 8px; font-size:10px;"
-        )
         self._status.setFixedHeight(20)
         root_layout.addWidget(self._status)
 

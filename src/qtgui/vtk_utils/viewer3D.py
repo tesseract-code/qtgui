@@ -1154,7 +1154,7 @@ class ModelViewerWidget(QWidget):
                 QIcon(
                     colorize_pixmap(
                         QPixmap("line-icons:box-3-line.svg"),
-                        self.palette().highlightedText().color(),
+                        self.palette().accent().color(),
                     )
                 )
             )
@@ -1164,7 +1164,7 @@ class ModelViewerWidget(QWidget):
                 QIcon(
                     colorize_pixmap(
                         QPixmap("line-icons:global-line.svg"),
-                        self.palette().highlightedText().color(),
+                        self.palette().accent().color(),
                     )
                 )
             )
