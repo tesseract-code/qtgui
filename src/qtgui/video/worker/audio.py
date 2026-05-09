@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 
-import pyaudio
+import sounddevice as sd
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from qtgui.video.worker.state import PlaybackStateManager
@@ -40,10 +40,9 @@ class AudioStreamWorker(QObject):
         # Audio parameters
         self.sample_rate  = 44100
         self.channels     = 2
-        self.sample_width = 2          # bytes — matches paInt16
+        self.sample_width = 2          # bytes — matches int16
 
         # Audio components
-        self._audio          = None
         self._stream         = None
         self._decode_process = None
         self._audio_queue    = queue.Queue(maxsize=100)
@@ -52,7 +51,7 @@ class AudioStreamWorker(QObject):
         self._current_seek_gen  = 0
         self._decode_position   = 0.0
 
-        # Volume / pause state read in the PA callback (C thread, no lock allowed).
+        # Volume / pause state read in the SD callback (C thread, no lock allowed).
         # _volume and _muted use plain assignment — atomic on CPython.
         # _is_playing_mirror is updated in the monitor loop and read in the
         # callback, avoiding the RLock acquisition that state.is_playing() would
@@ -109,31 +108,29 @@ class AudioStreamWorker(QObject):
         """
         logger.info("Audio worker starting")
         try:
-            self._audio = pyaudio.PyAudio()
-            logger.info("PyAudio initialized")
-
             decode_thread = threading.Thread(
                 target=self._decode_audio, daemon=True
             )
             decode_thread.start()
             logger.info("Decode thread started")
 
-            self._stream = self._audio.open(
-                format=pyaudio.paInt16,
+            # RawOutputStream works with plain bytes in the callback — no NumPy
+            # dependency.  blocksize matches the old frames_per_buffer value.
+            self._stream = sd.RawOutputStream(
+                samplerate=self.sample_rate,
                 channels=self.channels,
-                rate=self.sample_rate,
-                output=True,
-                stream_callback=self._audio_callback,
-                frames_per_buffer=1024,
+                dtype="int16",
+                blocksize=1024,
+                callback=self._audio_callback,
             )
-            self._stream.start_stream()
+            self._stream.start()
             logger.info("Audio stream started")
 
             loop_count = 0
             while self.state.is_running():
                 state = self.state.get_state()
 
-                # Mirror playing state for lock-free use in the PA callback.
+                # Mirror playing state for lock-free use in the SD callback.
                 self._is_playing_mirror = state.playing
 
                 if state.seek_generation != self._current_seek_gen:
@@ -288,18 +285,27 @@ class AudioStreamWorker(QObject):
         logger.info("Audio seek complete: gen now %d", self._current_seek_gen)
 
     # ------------------------------------------------------------------
-    # PyAudio callback
+    # sounddevice callback
     # ------------------------------------------------------------------
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
+    def _audio_callback(self, outdata, frames, time, status):
         """
-        Called by PyAudio on a dedicated C thread — must return quickly.
+        Called by sounddevice on a dedicated C thread — must return quickly.
 
-        Volume is applied by scaling the raw int16 PCM samples.  Muting or
-        pausing returns a silent buffer so we never output stale audio.
+        sounddevice RawOutputStream passes a writable buffer (outdata) that
+        we fill in-place.  Volume is applied by scaling the raw int16 PCM
+        samples.  Muting or pausing writes silence so we never output stale
+        audio.
+
+        Unlike the old PyAudio callback there is no return value; errors are
+        signalled by raising sd.CallbackStop / sd.CallbackAbort.
         """
         self._callback_count += 1
-        bytes_needed = frame_count * self.channels * self.sample_width
+
+        if status:
+            logger.warning("sounddevice callback status: %s", status)
+
+        bytes_needed = frames * self.channels * self.sample_width
 
         # ── silence when paused or muted ──────────────────────────────────
         if not self._is_playing_mirror or self._muted:
@@ -309,7 +315,8 @@ class AudioStreamWorker(QObject):
                     "Audio callback: silence (paused or muted), count=%d",
                     self._silence_count,
                 )
-            return bytes(bytes_needed), pyaudio.paContinue
+            outdata[:] = bytes(bytes_needed)
+            return
 
         if self._silence_count > 0:
             logger.debug(
@@ -346,7 +353,7 @@ class AudioStreamWorker(QObject):
                 chunks_retrieved,
             )
 
-        return output, pyaudio.paContinue
+        outdata[:] = output
 
     # ------------------------------------------------------------------
     # PCM volume scaling
@@ -379,7 +386,7 @@ class AudioStreamWorker(QObject):
     # ------------------------------------------------------------------
 
     def _cleanup(self):
-        """Release all PyAudio and subprocess resources."""
+        """Release all sounddevice and subprocess resources."""
         logger.info("Audio cleanup starting")
         # Unblock the decode thread if it is waiting on a full queue.
         self._seeking.set()
@@ -389,12 +396,11 @@ class AudioStreamWorker(QObject):
             except queue.Empty:
                 break
         if self._stream:
-            self._stream.stop_stream()
+            self._stream.stop()
             self._stream.close()
             logger.info("Audio stream closed")
-        if self._audio:
-            self._audio.terminate()
-            logger.info("PyAudio terminated")
+            # sounddevice manages the PortAudio session globally — no
+            # per-instance terminate() call is needed (unlike PyAudio).
         if self._decode_process:
             self._decode_process.kill()
             logger.info("Audio decode process killed")
