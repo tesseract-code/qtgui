@@ -8,8 +8,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QPushButton, QWidget, QToolButton, QVBoxLayout, QLabel
 )
 
-from cross_platform.dev.icons_legacy.svg_path import get_icon, IconType
 from qtcore.meta import QABCMeta
+from qtgui.icons import _get_line_icon
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent=parent)
         self.nav_collapsed = False
-        self.nav_items_data: List[Tuple[IconType, str]] = []
+        self.nav_items_data: List[Tuple[str, str]] = []
 
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint
@@ -222,7 +222,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
         self.toggle_button.setObjectName("toggleButton")
         self.toggle_button.setToolTip("Collapse/Expand Menu")
         self.toggle_button.setIcon(
-            get_icon(IconType.SIDEBAR_FOLD, QSize(256, 256),
+            _get_line_icon("sidebar-fold", QSize(256, 256),
                      self.palette().text().color())
         )
         self.toggle_button.setStyleSheet(TOGGLE_BUTTON_STYLESHEET)
@@ -264,7 +264,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
         """Create and configure the apply button."""
         apply_btn = QPushButton(self.get_apply_button_text())
         apply_btn.setIcon(
-            get_icon(IconType.SUCCESS, QSize(256, 256),
+            _get_line_icon("checkbox-circle", QSize(256, 256),
                      self.palette().buttonText().color())
         )
         apply_btn.setObjectName("applyButton")
@@ -276,11 +276,11 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
     def _toggle_navigation(self):
         """Toggle between expanded and collapsed navigation view."""
         self.nav_collapsed = not self.nav_collapsed
-        menu_icon_type = (IconType.SIDEBAR_UNFOLD
-                          if self.nav_collapsed else IconType.SIDEBAR_FOLD)
+        menu_icon_type = ("sidebar-fold"
+                          if self.nav_collapsed else "sidebar-unfold")
 
         self.toggle_button.setIcon(
-            get_icon(menu_icon_type, QSize(256, 256),
+            _get_line_icon(menu_icon_type, QSize(256, 256),
                      self.palette().text().color())
         )
 
@@ -297,7 +297,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
                     # palette rather than reusing a stale pre-built QIcon.
                     icon_type, text = self.nav_items_data[i]
                     item.setIcon(
-                        get_icon(icon_type, QSize(256, 256),
+                        _get_line_icon(icon_type, QSize(256, 256),
                                  self.palette().text().color())
                     )
                     item.setText("")
@@ -315,14 +315,14 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
                     # FIX 3: Same — fresh render on expand.
                     icon_type, text = self.nav_items_data[i]
                     item.setIcon(
-                        get_icon(icon_type, QSize(256, 256),
+                        _get_line_icon(icon_type, QSize(256, 256),
                                  self.palette().text().color())
                     )
                     item.setText(text)
                     item.setToolTip("")
                     item.setSizeHint(QSize())
 
-    def add_page(self, icon: IconType, title: str, widget: QWidget):
+    def add_page(self, icon: str, title: str, widget: QWidget):
         """Add a page to the navigation and content stack.
 
         Args:
@@ -334,7 +334,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
         # colour can always be recomputed against the live palette.
         self.nav_items_data.append((icon, title))
         item = QListWidgetItem(
-            get_icon(icon, QSize(256, 256), self.palette().text().color()),
+            _get_line_icon(icon, QSize(256, 256), self.palette().text().color()),
             title
         )
         self.nav_list.addItem(item)
@@ -382,7 +382,7 @@ class NavigableDialog(QDialog, metaclass=QABCMeta):
 
         Example::
 
-            return get_icon(IconType.SETTINGS, QSize(256, 256),
+            return _get_line_icon(IconType.SETTINGS, QSize(256, 256),
                             self.palette().text().color())
         """
         pass
