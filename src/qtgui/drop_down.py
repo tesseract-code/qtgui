@@ -5,7 +5,7 @@ from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon, QFont
 from PyQt6.QtWidgets import QToolButton, QSizePolicy, QWidget
 
-from cross_platform.dev.icons_legacy.svg_path import get_icon, IconType
+from qtgui.icons import _get_fill_icon
 
 
 class TitleFrame(QtWidgets.QFrame):
@@ -86,8 +86,8 @@ class TitleFrame(QtWidgets.QFrame):
             )
             # Start in collapsed state (arrow pointing down = will expand).
             self.arrow.setIcon(
-                get_icon(
-                    IconType.ARROW_DROP_DOWN,
+                _get_fill_icon(
+                    "arrow-drop-down",
                     QSize(256, 256),
                     self.palette().text().color(),
                 )
@@ -114,11 +114,13 @@ class TitleFrame(QtWidgets.QFrame):
         """
         if not self._is_collapsible or not hasattr(self, "arrow"):
             return
-        icon_type = (
-            IconType.ARROW_DROP_DOWN if is_collapsed else IconType.ARROW_DROP_UP
+        icon_name = (
+            "arrow-drop-down" if is_collapsed else "arrow-drop-up"
         )
         self.arrow.setIcon(
-            get_icon(icon_type, QSize(256, 256), self.palette().text().color())
+            _get_fill_icon(icon_name, QSize(256, 256), self.palette().text(
+
+            ).color())
         )
 
     def setMaximumHeight(self, maxh: int) -> None:

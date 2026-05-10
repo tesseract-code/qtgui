@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import (
 
 from cross_platform.dev.icons_legacy.svg_path import get_icon, IconType
 from qtcore.meta import QABCMeta
-from qtgui.style.dialog import StyledDialog
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +131,7 @@ APPLY_BUTTON_STYLESHEET = """
 """
 
 
-class NavigableDialog(StyledDialog, metaclass=QABCMeta):
+class NavigableDialog(QDialog, metaclass=QABCMeta):
     """Base class for settings dialogs with vertical navigation."""
 
     def __init__(self, parent: Optional[QWidget] = None):
