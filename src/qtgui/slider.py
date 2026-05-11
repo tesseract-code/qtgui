@@ -7,8 +7,7 @@ from PyQt6 import QtGui
 from PyQt6.QtCore import (QTimer, pyqtSignal, Qt, QSize, QPoint,
                           QEvent)
 from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
-from PyQt6.QtWidgets import QLabel, QWidget, QMainWindow, QSlider, QApplication
-from PyQt6.QtWidgets import QVBoxLayout
+from PyQt6.QtWidgets import QLabel, QWidget, QMainWindow, QSlider
 
 logger = logging.getLogger(__name__)
 
@@ -196,22 +195,6 @@ class RangeSlider(QWidget):
             logger.debug(
                 f"Monitoring main window for resize events: {self._main_window}")
 
-    # def event(self, event):
-    #     event_type = event.type()
-    #     # Handle window state changes and resize events
-    #     if (event_type in [QEvent.Type.Resize]):
-    #         # print(obj, event, self._window_resizing)
-    #
-    #         # Hide labels during resize/move operations
-    #         if not self._window_resizing:
-    #             self._low_label.hide()
-    #             self._high_label.hide()
-    #             self._window_resizing = True
-    #
-    #         # Restart the timer - we'll show labels when resize finishes
-    #         self._start_win_resize_timer.emit()
-    #     return super().event(event)
-
     def eventFilter(self, obj, event):
         """Event filter to catch main window resize, maximize, minimize, and move events"""
         if obj != self:
@@ -228,7 +211,6 @@ class RangeSlider(QWidget):
                 if not self._window_resizing:
                     self._low_label.hide()
                     self._high_label.hide()
-                    #     self._window_resizing = True
                     self._LABEL_THROTTLE_MS = 1000
 
                 # Restart the timer - we'll show labels when resize finishes
@@ -804,8 +786,6 @@ class RangeSlider(QWidget):
         range_color = QColor(66, 133, 244)
         handle_color = QColor(Qt.GlobalColor.white)
 
-
-
         # Draw tick marks if enabled
         if self._tick_position != QSlider.TickPosition.NoTicks:
             self._draw_ticks(painter, tick_color)
@@ -823,20 +803,19 @@ class RangeSlider(QWidget):
         self._request_label_update()
 
     def _draw_track(self, painter: QPainter, color: QColor):
-        """Draw the main slider track with handle padding."""
+        """Draw the main slider track, endpoints derived from _value_to_pixel
+        so the groove always aligns with tick marks and handles."""
         painter.setPen(QPen(color, 2))
 
         if self._orientation == Qt.Orientation.Horizontal:
             track_y = self.height() // 2
-            # Track is inset by handle radius to ensure handles fit
-            start_x = self._handle_radius
-            end_x = self.width() - self._handle_radius + 1
+            start_x = self._value_to_pixel(self._min_val)
+            end_x   = self._value_to_pixel(self._max_val)
             painter.drawLine(int(start_x), track_y, int(end_x), track_y)
         else:
             track_x = self.width() // 2
-            # Track is inset by handle radius to ensure handles fit
-            start_y = self._handle_radius
-            end_y = self.height() - self._handle_radius + 1
+            start_y = self._value_to_pixel(self._max_val)  # max is at the top (smaller y)
+            end_y   = self._value_to_pixel(self._min_val)  # min is at the bottom (larger y)
             painter.drawLine(track_x, int(start_y), track_x, int(end_y))
 
     def _draw_range(self, painter: QPainter, color: QColor):
@@ -855,8 +834,9 @@ class RangeSlider(QWidget):
 
     def _draw_handles(self, painter: QPainter, fill_color: QColor,
                       border_color: QColor):
-        """Draw the low and high handle circles."""
-        low_pos = self._value_to_pixel(self._low)
+        """Draw the low and high handle circles, centred exactly on the
+        pixel positions returned by _value_to_pixel (no ±1 nudge)."""
+        low_pos  = self._value_to_pixel(self._low)
         high_pos = self._value_to_pixel(self._high)
 
         painter.setBrush(QBrush(fill_color))
@@ -864,15 +844,14 @@ class RangeSlider(QWidget):
 
         if self._orientation == Qt.Orientation.Horizontal:
             center_y = self.height() // 2
-            # Draw handles - they will fit within widget bounds due to track padding
             painter.drawEllipse(
-                int((low_pos + 1) - self._handle_radius),
+                int(low_pos  - self._handle_radius),
                 center_y - self._handle_radius,
                 self._handle_radius * 2,
                 self._handle_radius * 2
             )
             painter.drawEllipse(
-                int((high_pos - 1) - self._handle_radius),
+                int(high_pos - self._handle_radius),
                 center_y - self._handle_radius,
                 self._handle_radius * 2,
                 self._handle_radius * 2
@@ -881,13 +860,13 @@ class RangeSlider(QWidget):
             center_x = self.width() // 2
             painter.drawEllipse(
                 center_x - self._handle_radius,
-                int((low_pos - 1) - self._handle_radius),
+                int(low_pos  - self._handle_radius),
                 self._handle_radius * 2,
                 self._handle_radius * 2
             )
             painter.drawEllipse(
                 center_x - self._handle_radius,
-                int((high_pos + 1) - self._handle_radius),
+                int(high_pos - self._handle_radius),
                 self._handle_radius * 2,
                 self._handle_radius * 2
             )
@@ -1106,12 +1085,9 @@ class RangeSlider(QWidget):
             self._high_label.hide()
             self._window_resizing = True
             self._force_label_update = True
-            # self._LABEL_THROTTLE_MS = 1000
 
         # Restart the timer - we'll show labels when resize finishes
         self._start_win_resize_timer.emit()
-        # self._force_label_update = True
-        # self._request_label_update()
 
     def moveEvent(self, event):
         """Handle move and update label positions with throttling"""
