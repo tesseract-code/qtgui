@@ -431,8 +431,7 @@ if __name__ == "__main__":
     from qtcore.app import Application
 
     app = Application(argv=sys.argv)
-    app.show_splash(image_path=r'/Users/pkkenne/Downloads/workspace_splash'
-                               r'.jpg', min_display_ms=1000)
+    app.show_splash(min_display_ms=1000)
     app.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     QSurfaceFormat.setDefaultFormat(get_surface_format())
 
